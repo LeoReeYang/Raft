@@ -2,6 +2,7 @@ package mr
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -9,28 +10,11 @@ import (
 	"net/rpc"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
 // Map functions return a slice of KeyValue.
-type KeyValue struct {
-	Key   string
-	Value string
-}
-
-// for sorting by key.
-type ByKey []KeyValue
-
-// for sorting by key.
-func (a ByKey) Len() int           { return len(a) }
-func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
-func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
-
-type Task struct {
-	TaskID   int
-	TaskType TaskType
-	FileName string
-}
 
 type worker struct {
 	workerID int
@@ -93,45 +77,37 @@ func CallExample() {
 	}
 }
 
-func (w *worker) Register() bool {
+func (w *worker) Register() error {
 	args := RegisterArgs{WorkerID: w.workerID}
 	reply := RegisterReply{}
 
 	if ok := call("Coordinator.Register", &args, &reply); ok {
 		w.nReduce = reply.Nreduce
 		w.mSplit = reply.MSplit
-		// fmt.Printf("Worker: %+v\n", w)
-		// fmt.Printf("Register reply: %+v\n", reply)
-		return ok
+		return nil
 	} else {
-		// log.Fatal("register call failed.\n")
-		return ok
+		panic(errors.New("register call failed"))
 	}
 }
 
 func (w *worker) RequestTask(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	args := TaskAskArgs{WorkerID: w.workerID}
-	reply := TaskAskReply{}
 
 	for {
-		if ok := call("Coordinator.GetTask", &args, &reply); ok {
-			// log.Printf("RequestTask : %+v\n", reply)
+		args := TaskAskArgs{WorkerID: w.workerID}
+		reply := TaskAskReply{}
 
-			task := reply.AssignedTask
+		if ok := call("Coordinator.GetTask", &args, &reply); ok {
+			task := reply.Task
 			switch task.TaskType {
 			case Map:
 				w.HandleMapTask(task.FileName, task.TaskID, mapf)
-				continue
 			case Reduce:
 				w.HandleReduceTask(task.TaskID, reducef)
-				continue
 			case Wait:
-				time.Sleep(200 * time.Millisecond)
-				log.Printf("All tasks are handling...will request task after 2s.\n")
-				continue
+				time.Sleep(time.Duration(5 * time.Second))
 			case Exit:
-				log.Printf("All tasks are done...exit.\n")
+				log.Printf("All tasks are done.\n")
 				return
 			}
 		}
@@ -156,7 +132,7 @@ func (w *worker) HandleMapTask(filename string, taskid int, mapf func(string, st
 	intermediate = append(intermediate, kva...)
 
 	tempfiles := make([]*os.File, w.nReduce)
-	filesEncoder := make([]*json.Encoder, w.nReduce)
+	fileEncoders := make([]*json.Encoder, w.nReduce)
 
 	path, err := os.Getwd()
 	if err != nil {
@@ -169,12 +145,12 @@ func (w *worker) HandleMapTask(filename string, taskid int, mapf func(string, st
 			log.Fatal("create tempfile failed.\n", err)
 		}
 		tempfiles[i] = f
-		filesEncoder[i] = json.NewEncoder(f)
+		fileEncoders[i] = json.NewEncoder(f)
 	}
 
 	for _, kv := range intermediate {
 		hash := ihash(kv.Key) % w.nReduce
-		err := filesEncoder[hash].Encode(&kv)
+		err := fileEncoders[hash].Encode(&kv)
 		if err != nil {
 			log.Fatal("encode failed.\n", err)
 		}
@@ -185,11 +161,8 @@ func (w *worker) HandleMapTask(filename string, taskid int, mapf func(string, st
 		if err != nil {
 			log.Fatal("rename failed.\n", err)
 		}
+		file.Close()
 	}
-
-	// sort.Sort(ByKey(intermediate))
-
-	// path := "/home/yu/6.824/src/main"
 
 	reply := w.FinishTask(filename, taskid, Map)
 	if reply == nil {
@@ -198,59 +171,62 @@ func (w *worker) HandleMapTask(filename string, taskid int, mapf func(string, st
 }
 
 func (w *worker) HandleReduceTask(taskid int, reducef func(string, []string) string) {
-	file := fmt.Sprintf("mr-out-%d", taskid)
-	if _, err := os.Stat(file); err == nil {
-		os.Remove(file)
-	}
-
-	outfile, err := os.OpenFile(file, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0666)
-	if err != nil {
-		log.Fatal("can't open mr-out-file.", err)
-	}
-
-	defer outfile.Close()
-
-	// i := 0
+	kvs := []KeyValue{}
 	for i := 0; i < w.mSplit; i++ {
 		f, err := os.Open(fmt.Sprintf("mr-%d-%d", i, taskid))
 		if err != nil {
-			log.Fatal(err)
+			log.Fatal("open file failed.\n", err)
 		}
+
 		dec := json.NewDecoder(f)
-		kvs := []KeyValue{}
 		for {
-			var KV KeyValue
-			if err := dec.Decode(&KV); err != nil {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
 				break
 			}
-			kvs = append(kvs, KV)
+			kvs = append(kvs, kv)
 		}
-
-		j := 0
-		for j < len(kvs) {
-			k := j + 1
-			for k < len(kvs) && kvs[k].Key == kvs[j].Key {
-				k++
-			}
-
-			values := []string{}
-
-			for m := j; m < k; m++ {
-				values = append(values, kvs[m].Value)
-			}
-			output := reducef(kvs[j].Key, values)
-
-			_, err := fmt.Fprintf(outfile, "%v %v\n", kvs[j].Key, output)
-			if err != nil {
-				log.Fatal("write output file failed\n")
-			}
-			j = k
-		}
+		f.Close()
 	}
-	reply := w.FinishTask(file, taskid, Reduce)
+
+	sort.Sort(ByKey(kvs))
+
+	path, err := os.Getwd()
+	if err != nil {
+		log.Fatal("can't create tempfile\n", err)
+	}
+
+	f, err := os.CreateTemp(path, fmt.Sprintf("mr-out-%d", taskid)+"-*.txt")
+	if err != nil {
+		log.Fatalf("failed create temp reduce output file.")
+	}
+
+	i := 0
+	for i < len(kvs) {
+		j := i + 1
+		for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+			j++
+		}
+
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kvs[k].Value)
+		}
+		fmt.Fprintf(f, "%v %v\n", kvs[i].Key, reducef(kvs[i].Key, values))
+		i = j
+	}
+
+	//	if the target file exist,new file will replace the old one
+	err = os.Rename(filepath.Join(f.Name()), fmt.Sprintf("mr-out-%d", taskid))
+	if err != nil {
+		log.Fatalf("Rename ReduceTask failed\n")
+	}
+
+	reply := w.FinishTask(fmt.Sprintf("mr-out-%d", taskid), taskid, Reduce)
 	if reply == nil {
-		log.Fatal("finish reduce task failed")
+		log.Fatal("finish task failed\n")
 	}
+	f.Close()
 }
 
 func (w *worker) FinishTask(fname string, taskid int, taskType TaskType) *TaskFinishReply {
@@ -262,9 +238,10 @@ func (w *worker) FinishTask(fname string, taskid int, taskType TaskType) *TaskFi
 	reply := TaskFinishReply{}
 
 	if ok := call("Coordinator.FinishTask", &args, &reply); ok {
+		log.Printf("finish task:  id:%d   name:%v type:%v\n\n", taskid, fname, taskType)
 		return &reply
 	} else {
-		log.Println("FinishTask call failed.")
+		log.Fatal("FinishTask call failed.\n")
 		return nil
 	}
 }
