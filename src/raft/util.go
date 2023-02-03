@@ -90,30 +90,12 @@ func (rf *Raft) appendLog(command interface{}) (index int) {
 	return len(rf.log) - 1
 }
 
-func (rf *Raft) resetElectionTimer() {
-	random := GetRandomTime()
-	if rf.electionTimer.Stop() {
-		select {
-		case <-rf.electionTimer.C:
-		default:
-		}
-	}
-	rf.electionTimer.Reset(random)
-}
-
 func (rf *Raft) requestVoteArgs() *RequestVoteArgs {
 	return &RequestVoteArgs{
 		Term:         rf.GetCurrentTerm(),
 		CandidateId:  rf.me,
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
-	}
-}
-
-func (rf *Raft) HeartbeatArgs() *AppendEntriesArgs {
-	return &AppendEntriesArgs{
-		Term:     rf.GetCurrentTerm(),
-		LeaderId: rf.me,
 	}
 }
 
@@ -125,18 +107,21 @@ func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	nextIdx := rf.nextIndex[id]
-	entries := rf.log[nextIdx:]
-	if len(entries) > 0 {
-		DPrintf("leader %v try to send to id = %v , nextIdx = %v, entries = %v\n", rf.me, id, nextIdx, entries)
+	next := rf.nextIndex[id]
+	var entries []Entry
+	m := 1
+
+	if len(rf.log) > 1 {
+		m = min(next, len(rf.log)-1)
+		entries = append(entries, rf.log[m:]...)
 	}
 
 	return &AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
 		Entries:      entries,
-		PrevLogIndex: nextIdx - 1,
-		PrevLogTerm:  rf.log[nextIdx-1].Term,
+		PrevLogIndex: m - 1,
+		PrevLogTerm:  rf.log[m-1].Term,
 		LeaderCommit: rf.commitIndex,
 	}
 }
@@ -149,73 +134,72 @@ func (rf *Raft) applyMsg(applyID int) ApplyMsg {
 	}
 }
 
-func (rf *Raft) updateLastApplyID() {
-	for rf.lastApplied < rf.commitIndex {
-		rf.lastApplied++
-		rf.apply <- rf.applyMsg(rf.lastApplied)
-	}
-}
-
-func (rf *Raft) updateIndex(id, replicateIdx int) {
+func (rf *Raft) UpdateIndex(id, replicateIdx int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	rf.nextIndex[id] = replicateIdx
 	rf.matchIndex[id] = rf.nextIndex[id] - 1
+	DPrintf("leader %v update peer %v 's nextxIndex = %v, CurrentTerm= %v\n", rf.me, id, replicateIdx, rf.currentTerm)
+}
 
-	DPrintf("leader %v update peer %v 's nextxIndex = %v, matchIndex = %v\n", rf.me, id, replicateIdx, replicateIdx-1)
+func (rf *Raft) UpdateCommit() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	count := 0
-	commit := rf.commitIndex + 1
-
-	for id, idx := range rf.matchIndex {
-		if id == rf.me || idx >= commit {
-			count++
-		}
-		if id != rf.me {
-			DPrintf("%v's matchindex = %v, count = %v\n", id, idx, count)
-		}
-
-		if count >= (len(rf.peers)+1)/2 {
-			rf.commitIndex = commit
-			DPrintf("leader %d update commitIndex = %v, command = %v,\n", rf.me, rf.commitIndex, rf.log[commit])
-			break
+	for i := rf.lastLogIndex(); i > rf.commitIndex && rf.log[i].Term == rf.currentTerm; i-- {
+		count := 0
+		for id, idx := range rf.matchIndex {
+			if id == rf.me || idx >= i {
+				count++
+			}
+			if count >= (len(rf.peers)+1)/2 {
+				rf.commitIndex = i
+				DPrintf("leader %d update commitIndex = %v, CurrentTerm = %d, lastApplyId = %d, lastLog = %v\n", rf.me, rf.commitIndex, rf.currentTerm, rf.lastApplied, rf.log[rf.lastLogIndex()])
+				return
+			}
 		}
 	}
-
-	rf.updateLastApplyID()
 }
 
 func (rf *Raft) DecreaseNextIndex(id int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	next := rf.nextIndex[id]
-	match := rf.matchIndex[id]
-	if next >= match+1 {
-		rf.nextIndex[id] = 1
-		idx := next - (next-match)/2 - 1
-		if idx > 0 {
-			rf.nextIndex[id] = idx
-		}
+	rf.nextIndex[id] = rf.nextIndex[id] - (rf.nextIndex[id]-rf.matchIndex[id])/2 - 1
+	if rf.nextIndex[id] <= rf.matchIndex[id] {
+		rf.nextIndex[id] = rf.matchIndex[id] + 1
 	}
 }
 
-func (rf *Raft) ConvertRole(argsTerm int) {
+func (rf *Raft) ConvertRole(argsTerm int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.convertRole(argsTerm)
+	return rf.convertRole(argsTerm)
 }
 
-func (rf *Raft) convertRole(argsTerm int) {
+func (rf *Raft) convertRole(argsTerm int) bool {
+	ret := false
 	if argsTerm > rf.currentTerm {
 		rf.status = Follower
 		rf.votedFor = Null
 		rf.currentTerm = argsTerm
+		ret = true
+		// DPrintf("			%v change term = %v, votedFor = %v due to higher Term\n", rf.me, rf.currentTerm, rf.votedFor)
 	}
+	return ret
 }
 
 func (rf *Raft) lastLogIndex() int {
 	return len(rf.log) - 1
+}
+
+func (rf *Raft) nextInitial() {
+	for id := range rf.nextIndex {
+		if id == rf.me {
+			continue
+		}
+		rf.nextIndex[id] = rf.lastLogIndex() + 1
+	}
 }

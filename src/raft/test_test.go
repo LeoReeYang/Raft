@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -146,10 +148,8 @@ func TestBasicAgree2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // check, based on counting bytes of RPCs, that
 // each command is sent to each peer just once.
-//
 func TestRPCBytes2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -181,9 +181,7 @@ func TestRPCBytes2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // test just failure of followers.
-//
 func For2023TestFollowerFailure2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -228,9 +226,7 @@ func For2023TestFollowerFailure2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // test just failure of leaders.
-//
 func For2023TestLeaderFailure2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -270,10 +266,8 @@ func For2023TestLeaderFailure2B(t *testing.T) {
 	cfg.end()
 }
 
-//
 // test that a follower participates after
 // disconnect and re-connect.
-//
 func TestFailAgree2B(t *testing.T) {
 	servers := 3
 	cfg := make_config(t, servers, false, false)
@@ -802,7 +796,6 @@ func TestPersist32C(t *testing.T) {
 	cfg.end()
 }
 
-//
 // Test the scenarios described in Figure 8 of the extended Raft paper. Each
 // iteration asks a leader, if there is one, to insert a command in the Raft
 // log.  If there is a leader, that leader will fail quickly with a high
@@ -811,21 +804,22 @@ func TestPersist32C(t *testing.T) {
 // alive servers isn't enough to form a majority, perhaps start a new server.
 // The leader in a new term may try to finish replicating log entries that
 // haven't been committed yet.
-//
 func TestFigure82C(t *testing.T) {
 	servers := 5
 	cfg := make_config(t, servers, false, false)
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2C): Figure 8")
-
+	// cmd := rand.Int() % servers
 	cfg.one(rand.Int(), 1, true)
+	// DPrintf("cfg.one, cmd = %v done...\n", cmd)
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
+				// cmd := rand.Int() % servers
 				_, _, ok := cfg.rafts[i].Start(rand.Int())
 				if ok {
 					leader = i
@@ -844,6 +838,7 @@ func TestFigure82C(t *testing.T) {
 		if leader != -1 {
 			cfg.crash1(leader)
 			nup -= 1
+			// DPrintf("leader %v crash...nup = %v\n", leader, nup)
 		}
 
 		if nup < 3 {
@@ -852,6 +847,7 @@ func TestFigure82C(t *testing.T) {
 				cfg.start1(s, cfg.applier)
 				cfg.connect(s)
 				nup += 1
+				// DPrintf("restart %v and connect to net, nup = %v\n", s, nup)
 			}
 		}
 	}
@@ -860,10 +856,13 @@ func TestFigure82C(t *testing.T) {
 		if cfg.rafts[i] == nil {
 			cfg.start1(i, cfg.applier)
 			cfg.connect(i)
+			// DPrintf("%v is nil ,start and connect to net\n", i)
 		}
 	}
 
+	// cmd = rand.Int() % servers
 	cfg.one(rand.Int(), servers, true)
+	// DPrintf("cfg.one, cmd = %v\n", cmd)
 
 	cfg.end()
 }
@@ -929,6 +928,14 @@ func TestFigure8Unreliable2C(t *testing.T) {
 
 		if leader != -1 && (rand.Int()%1000) < int(RaftElectionTimeout/time.Millisecond)/2 {
 			cfg.disconnect(leader)
+			// DPrintf("%d disconnect...Term = %d\n", leader, cfg.rafts[leader].GetCurrentTerm())
+			// var alives []int
+			// for i, alive := range cfg.connected {
+			// 	if alive {
+			// 		alives = append(alives, i)
+			// 	}
+			// }
+			// DPrintf("%v are alive...\n", alives)
 			nup -= 1
 		}
 
@@ -936,6 +943,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 			s := rand.Int() % servers
 			if cfg.connected[s] == false {
 				cfg.connect(s)
+				// DPrintf("due to nup < 3, %d connect...status = %v\n", s, cfg.rafts[s].GetStatus())
 				nup += 1
 			}
 		}
@@ -944,6 +952,7 @@ func TestFigure8Unreliable2C(t *testing.T) {
 	for i := 0; i < servers; i++ {
 		if cfg.connected[i] == false {
 			cfg.connect(i)
+			// DPrintf("%d connect...status = %v\n", i, cfg.rafts[i].GetStatus())
 		}
 	}
 
@@ -1192,11 +1201,9 @@ func TestSnapshotInstallUnCrash2D(t *testing.T) {
 	snapcommon(t, "Test (2D): install snapshots (unreliable+crash)", false, false, true)
 }
 
-//
 // do the servers persist the snapshots, and
 // restart using snapshot along with the
 // tail of the log?
-//
 func TestSnapshotAllCrash2D(t *testing.T) {
 	servers := 3
 	iters := 5
