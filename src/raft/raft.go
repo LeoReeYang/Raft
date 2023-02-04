@@ -207,16 +207,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	if rf.convertRole(args.Term) {
 		rf.persist()
-		// DPrintf("\t\t%v update term = %v when vote request, persisted...\n", rf.me, args.Term)
 	}
 
 	if (rf.votedFor == Null || rf.votedFor == args.CandidateId) &&
 		rf.candidateHasNewerLog(args.LastLogTerm, args.LastLogIndex) {
 
 		rf.votedFor = args.CandidateId
-		rf.persist()
 		reply.VoteGranted = true
 		rf.validAccess = true
+		rf.persist()
 		DPrintf("\t\t%v votedFor = %v, term = %d, persisted...\n", rf.me, args.CandidateId, rf.currentTerm)
 		return
 	}
@@ -247,7 +246,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	rf.status = Follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.status = Follower
+		rf.persist()
+		return
+	}
+
 	rf.validAccess = true
 	if !rf.containLog(args.PrevLogTerm, args.PrevLogIndex) {
 		return
@@ -258,17 +263,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log = append(rf.log, args.Entries...)
 	rf.persist()
 
-	// if len(args.Entries) == 0 {
-	// 	// DPrintf("\t\t%v get a heartbeat\n", rf.me)
-	// } else {
-	// 	DPrintf("\t\t%v append log, index = %v, entry = %v, persisted...\n", rf.me, args.PrevLogIndex+1, args.Entries)
-	// }
-
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(rf.lastLogIndex(), args.LeaderCommit)
+		rf.applyCond.Signal()
 		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d, lastLog = %v\n", rf.me, rf.commitIndex, rf.lastApplied, rf.log[rf.lastLogIndex()])
 	}
-	rf.applyCond.Signal()
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -368,13 +367,10 @@ func (rf *Raft) startElection() {
 	rf.currentTerm++
 	rf.status = Candidate
 	rf.votedFor = rf.me
-	rf.validAccess = true
 	rf.persist()
-	rf.nextInitial()
-	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v] , persisted...\n", rf.me, rf.currentTerm, rf.log[len(rf.log)-1].Term, len(rf.log)-1)
-	rf.mu.Unlock()
-
 	args := rf.requestVoteArgs()
+	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n", rf.me, rf.currentTerm, rf.log[rf.lastLogIndex()].Term, rf.lastLogIndex())
+	rf.mu.Unlock()
 
 	votesChan := make(chan bool, len(rf.peers))
 	for id := range rf.peers {
@@ -414,24 +410,27 @@ func (rf *Raft) startElection() {
 			voteCnt++
 		}
 
-		role := rf.GetStatus()
-		if role != Candidate {
-			break
-		}
-
-		if voteCnt >= (len(rf.peers)+1)/2 {
-			rf.UpdateStatus(Leader)
-			DPrintf("\t\t%v becomes leader, term = %d\n", rf.me, rf.GetCurrentTerm())
-			break
-		}
-
-		if voteCnt+len(rf.peers)-iter < (len(rf.peers)+1)/2 {
-			break
+		rf.mu.Lock()
+		if rf.status == Candidate {
+			if voteCnt > len(rf.peers)/2 {
+				rf.status = Leader
+				rf.nextInitial()
+				rf.matchInitial()
+				rf.mu.Unlock()
+				return
+			}
+			if voteCnt+len(rf.peers)-iter < (len(rf.peers)+1)/2 {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
+		} else {
+			rf.mu.Unlock()
+			return
 		}
 	}
 }
 
-// leader change?
 func (rf *Raft) heartbeat() {
 	term := rf.GetCurrentTerm()
 	for id := range rf.peers {
@@ -483,11 +482,11 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.electionTicker.C:
 			rf.electionTicker.Reset(GetRandomTime())
-			if ok := rf.canElection(); ok {
+			if rf.canElection() {
 				go rf.startElection()
 			}
 		case <-rf.heartbeatTicker.C:
-			if role := rf.GetStatus(); role == Leader {
+			if rf.GetStatus() == Leader {
 				go rf.heartbeat()
 			}
 		}
@@ -498,13 +497,9 @@ func (rf *Raft) canElection() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if !rf.validAccess && rf.status != Leader {
-		rf.validAccess = false
-		return true
-	} else {
-		rf.validAccess = false
-		return false
-	}
+	shouldElection := !rf.validAccess && rf.status != Leader
+	rf.validAccess = false
+	return shouldElection
 }
 
 func (rf *Raft) applyLogs() {

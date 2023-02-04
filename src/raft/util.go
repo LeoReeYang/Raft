@@ -43,12 +43,6 @@ func GetRandomTime() time.Duration {
 	return time.Duration(BaseIntervalTime+rand.Intn(RandomTimeValue)) * time.Millisecond
 }
 
-func (rf *Raft) initialNextIndex() {
-	for id := range rf.nextIndex {
-		rf.nextIndex[id] = 1
-	}
-}
-
 func (rf *Raft) UpdateStatus(status Status) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -92,7 +86,7 @@ func (rf *Raft) appendLog(command interface{}) (index int) {
 
 func (rf *Raft) requestVoteArgs() *RequestVoteArgs {
 	return &RequestVoteArgs{
-		Term:         rf.GetCurrentTerm(),
+		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: len(rf.log) - 1,
 		LastLogTerm:  rf.log[len(rf.log)-1].Term,
@@ -153,7 +147,7 @@ func (rf *Raft) UpdateCommit() {
 			if id == rf.me || idx >= i {
 				count++
 			}
-			if count >= (len(rf.peers)+1)/2 {
+			if count > len(rf.peers)/2 {
 				rf.commitIndex = i
 				DPrintf("leader %d update commitIndex = %v, CurrentTerm = %d, lastApplyId = %d, lastLog = %v\n", rf.me, rf.commitIndex, rf.currentTerm, rf.lastApplied, rf.log[rf.lastLogIndex()])
 				return
@@ -201,5 +195,11 @@ func (rf *Raft) nextInitial() {
 			continue
 		}
 		rf.nextIndex[id] = rf.lastLogIndex() + 1
+	}
+}
+
+func (rf *Raft) matchInitial() {
+	for id := range rf.matchIndex {
+		rf.matchIndex[id] = 0
 	}
 }
