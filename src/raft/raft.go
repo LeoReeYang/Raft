@@ -80,6 +80,7 @@ type Raft struct {
 	electionTicker  *time.Ticker
 	heartbeatTicker *time.Ticker
 	applyCond       *sync.Cond
+	snapShotIndex   int
 }
 
 // return currentTerm and whether this server
@@ -114,8 +115,14 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	raft := w.Bytes()
+	rf.persister.SaveRaftState(raft)
+
+	// w = new(bytes.Buffer)
+	// e = labgob.NewEncoder(w)
+	// e.Encode(rf.log)
+	// snapshot := w.Bytes()
+	// rf.persister.SaveStateAndSnapshot(raft, snapshot)
 
 	// DPrintf("			%d persist raft state, currentTerm = %v ,votedFor = %v, log = %v\n",
 	// 	rf.me, rf.currentTerm, rf.votedFor, rf.log)
@@ -145,13 +152,11 @@ func (rf *Raft) readPersist(data []byte) {
 	var votedFor int
 	var log []Entry
 	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
-		// DPrintf("			%v failed to read Persist state\n", rf.me)
 		return
 	} else {
 		rf.currentTerm = term
 		rf.votedFor = votedFor
 		rf.log = log
-		// DPrintf("			%v read Persist state ok.\n", rf.me)
 	}
 }
 
@@ -170,8 +175,34 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	log := make([]Entry, 1)
+	actual := rf.getActual(index)
+	log[0] = rf.log[actual]
+
+	log = append(log, rf.log[actual+1:]...)
+	rf.log = log
+	rf.snapShotIndex = index
+	rf.persist()
+	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimed log :%v", rf.me, index, rf.log[0], rf.log)
 }
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []Entry
+	Done              bool
+}
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {}
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -219,7 +250,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("\t\t%v votedFor = %v, term = %d, persisted...\n", rf.me, args.CandidateId, rf.currentTerm)
 		return
 	}
-	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v]\n", rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.lastLogIndex()].Term, rf.lastLogIndex())
+	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v]\n", rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.getActual(rf.lastLogIndex())].Term, rf.getLogical(rf.lastLogIndex()))
 }
 
 type AppendEntriesArgs struct {
@@ -264,9 +295,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.persist()
 
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(rf.lastLogIndex(), args.LeaderCommit)
+		rf.commitIndex = min(rf.getLogical(rf.lastLogIndex()), args.LeaderCommit)
 		rf.applyCond.Signal()
-		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d, lastLog = %v\n", rf.me, rf.commitIndex, rf.lastApplied, rf.log[rf.lastLogIndex()])
+		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d, \n\t\tlog = %v\n", rf.me, rf.commitIndex, rf.lastApplied, rf.log)
 	}
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -369,7 +400,7 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.persist()
 	args := rf.requestVoteArgs()
-	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n", rf.me, rf.currentTerm, rf.log[rf.lastLogIndex()].Term, rf.lastLogIndex())
+	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n", rf.me, rf.currentTerm, rf.log[rf.getActual(rf.lastLogIndex())].Term, rf.getLogical(rf.lastLogIndex()))
 	rf.mu.Unlock()
 
 	votesChan := make(chan bool, len(rf.peers))
@@ -442,11 +473,6 @@ func (rf *Raft) heartbeat() {
 			reply := &AppendEntriesReply{}
 
 			if ok := rf.sendAppendEntries(serverID, args, reply); !ok {
-				// if len(args.Entries) == 0 {
-				// 	DPrintf("leader %v failed to send heartbeat to server %v\n", args.LeaderId, serverID)
-				// } else {
-				// 	DPrintf("leader %v failed to copy log to server %v\n", args.LeaderId, serverID)
-				// }
 				return
 			}
 
@@ -493,15 +519,6 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) canElection() bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	shouldElection := !rf.validAccess && rf.status != Leader
-	rf.validAccess = false
-	return shouldElection
-}
-
 func (rf *Raft) applyLogs() {
 	rf.applyCond.L.Lock()
 
@@ -529,7 +546,7 @@ func (rf *Raft) applyLog(applyid int) bool {
 
 	select {
 	case rf.applyCh <- msg:
-		DPrintf("\t\t%v apply a msg ,term = %d, applyLog = %v, applyIndx = %d\n", rf.me, rf.currentTerm, rf.log[msg.CommandIndex], msg.CommandIndex)
+		DPrintf("\t\t%v apply a msg ,term = %d, applyLog = %v, applyIndx = %d\nlog = %v\n", rf.me, rf.currentTerm, rf.log[rf.getActual(msg.CommandIndex)], msg.CommandIndex, rf.log)
 		return true
 	case <-timer.C:
 		return false
@@ -566,9 +583,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTicker = time.NewTicker(GetRandomTime())
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.snapShotIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.persister.snapshot = rf.persister.ReadSnapshot()
 	// DPrintf("%v read Persist state,Term = %v, VotedFor = %v, Log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.log)
 
 	// start ticker goroutine to start elections
