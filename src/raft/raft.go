@@ -74,13 +74,13 @@ type Raft struct {
 	lastApplied     int
 	nextIndex       []int
 	matchIndex      []int
+	snapshotIndex   int
 	status          Status
 	applyCh         chan ApplyMsg
 	validAccess     bool
 	electionTicker  *time.Ticker
 	heartbeatTicker *time.Ticker
 	applyCond       *sync.Cond
-	snapShotIndex   int
 }
 
 // return currentTerm and whether this server
@@ -170,14 +170,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.mu.Unlock()
 
 	log := make([]Entry, 1)
-	actual := rf.getActual(index)
+	actual := rf.actual(index)
 	log[0] = rf.log[actual]
 
 	log = append(log, rf.log[actual+1:]...)
 	rf.log = log
-	rf.snapShotIndex = index
+	rf.snapshotIndex = index
 	rf.persist()
-	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimed log :%v", rf.me, index, rf.log[0], rf.log)
+	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimmed log :%v", rf.me, index, rf.log[0], rf.log)
 }
 
 type InstallSnapshotArgs struct {
@@ -185,12 +185,11 @@ type InstallSnapshotArgs struct {
 	LeaderId          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	Offset            int
 	Data              []Entry
-	Done              bool
 }
 type InstallSnapshotReply struct {
-	Term int
+	Term    int
+	Success bool
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {}
@@ -232,16 +231,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	if (rf.votedFor == Null || rf.votedFor == args.CandidateId) &&
-		rf.candidateHasNewerLog(args.LastLogTerm, args.LastLogIndex) {
+		rf.candidateNewer(args.LastLogTerm, args.LastLogIndex) {
 
+		rf.validAccess = true
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		rf.validAccess = true
 		rf.persist()
 		DPrintf("\t\t%v votedFor = %v, term = %d, persisted...\n", rf.me, args.CandidateId, rf.currentTerm)
 		return
 	}
-	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v]\n", rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.getActual(rf.lastLogIndex())].Term, rf.getLogical(rf.lastLogIndex()))
+	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v]\n",
+		rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.actual(rf.lastLogIndex())].Term, rf.logical(rf.lastLogIndex()))
 }
 
 type AppendEntriesArgs struct {
@@ -270,10 +270,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.validAccess = true
 
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		rf.status = Follower
-		rf.votedFor = Null
+	if rf.convertRole(args.Term) {
 		rf.persist()
 	}
 
@@ -282,15 +279,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	reply.Success = true
-	rf.log = rf.truncateLog(args.PrevLogIndex + 1)
-	rf.log = append(rf.log, args.Entries...)
-	rf.persist()
-
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(rf.getLogical(rf.lastLogIndex()), args.LeaderCommit)
-		rf.applyCond.Signal()
-		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d\n", rf.me, rf.commitIndex, rf.lastApplied)
-	}
+	rf.updateLog(args)
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -347,10 +336,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-	if rf.killed() {
-		return index, term, false
-	}
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -393,7 +378,7 @@ func (rf *Raft) startElection() {
 	rf.persist()
 	args := rf.requestVoteArgs()
 	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n",
-		rf.me, rf.currentTerm, rf.log[rf.getActual(rf.lastLogIndex())].Term, rf.getLogical(rf.lastLogIndex()))
+		rf.me, rf.currentTerm, rf.log[rf.actual(rf.lastLogIndex())].Term, rf.logical(rf.lastLogIndex()))
 	rf.mu.Unlock()
 
 	votesChan := make(chan bool, len(rf.peers))
@@ -461,11 +446,11 @@ func (rf *Raft) heartbeat() {
 		if id == rf.me {
 			continue
 		}
-		go func(serverID int) {
-			args := rf.AppendEntriesArgs(term, serverID)
+		go func(serverId int) {
+			args := rf.AppendEntriesArgs(term, serverId)
 			reply := &AppendEntriesReply{}
 
-			if ok := rf.sendAppendEntries(serverID, args, reply); !ok {
+			if ok := rf.sendAppendEntries(serverId, args, reply); !ok {
 				return
 			}
 
@@ -478,11 +463,10 @@ func (rf *Raft) heartbeat() {
 			rf.mu.Unlock()
 
 			if reply.Success {
-				rf.UpdateIndex(serverID, args.PrevLogIndex+1+len(args.Entries))
+				rf.UpdateIndex(serverId, args.PrevLogIndex+1+len(args.Entries))
 				rf.UpdateCommit()
-				// rf.applyCond.Signal()
 			} else {
-				rf.DecreaseNextIndex(serverID)
+				rf.DecreaseNextIndex(serverId)
 			}
 		}(id)
 	}
@@ -500,7 +484,7 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.electionTicker.C:
 			rf.electionTicker.Reset(GetRandomTime())
-			if rf.canElection() {
+			if rf.canElect() {
 				go rf.startElection()
 			}
 		case <-rf.heartbeatTicker.C:
@@ -517,7 +501,7 @@ func (rf *Raft) applyLogs() {
 	go func() {
 		for {
 			rf.applyCond.Wait()
-			for rf.lastApplied+1 <= rf.commitIndex {
+			for rf.lastApplied < rf.commitIndex {
 				if !rf.applyLog(rf.lastApplied + 1) {
 					rf.mu.Unlock()
 					time.Sleep(200 * time.Millisecond)
@@ -538,7 +522,8 @@ func (rf *Raft) applyLog(applyid int) bool {
 
 	select {
 	case rf.applyCh <- msg:
-		DPrintf("\t\t%v apply a msg ,term = %d, applyLog = %v, applyIndx = %d\n", rf.me, rf.currentTerm, rf.log[rf.getActual(msg.CommandIndex)], msg.CommandIndex)
+		DPrintf("\t\t%v apply a msg ,term = %d, applyLog = %v, applyIndx = %d\n",
+			rf.me, rf.currentTerm, rf.log[rf.actual(msg.CommandIndex)], msg.CommandIndex)
 		return true
 	case <-timer.C:
 		return false
@@ -575,7 +560,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTicker = time.NewTicker(GetRandomTime())
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
 	rf.applyCond = sync.NewCond(&rf.mu)
-	rf.snapShotIndex = 0
+	rf.snapshotIndex = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

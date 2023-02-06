@@ -7,7 +7,7 @@ import (
 )
 
 // Debugging
-const Debug = true
+const Debug = false
 
 const (
 	BaseIntervalTime int = 650
@@ -64,15 +64,15 @@ func (rf *Raft) GetCurrentTerm() int {
 	return rf.currentTerm
 }
 
-func (rf *Raft) candidateHasNewerLog(lastLogTerm, lastLogIndex int) bool {
+func (rf *Raft) candidateNewer(lastLogTerm, lastLogIndex int) bool {
 	myLastTerm := rf.log[rf.lastLogIndex()].Term
-	return lastLogTerm > myLastTerm || lastLogTerm == myLastTerm && lastLogIndex >= rf.getLogical(rf.lastLogIndex())
+	return lastLogTerm > myLastTerm || lastLogTerm == myLastTerm && lastLogIndex >= rf.logical(rf.lastLogIndex())
 }
 
 func (rf *Raft) containLog(term, index int) bool {
-	lastLogIndex := rf.getLogical(rf.lastLogIndex())
+	lastLogIndex := rf.logical(rf.lastLogIndex())
 
-	return index <= lastLogIndex && term == rf.log[rf.getActual(index)].Term
+	return index <= lastLogIndex && term == rf.log[rf.actual(index)].Term
 }
 
 func (rf *Raft) appendLog(command interface{}) (index int) {
@@ -81,22 +81,22 @@ func (rf *Raft) appendLog(command interface{}) (index int) {
 		Command: command,
 	}
 	rf.log = append(rf.log, entry)
-	return rf.getLogical(rf.lastLogIndex())
+	return rf.logical(rf.lastLogIndex())
 }
 
 func (rf *Raft) requestVoteArgs() *RequestVoteArgs {
-	logic := rf.getLogical(rf.lastLogIndex())
+	index := rf.logical(rf.lastLogIndex())
 	term := rf.log[rf.lastLogIndex()].Term
 	return &RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: logic,
+		LastLogIndex: index,
 		LastLogTerm:  term,
 	}
 }
 
 func (rf *Raft) truncateLog(end int) []Entry {
-	return rf.log[:rf.getActual(end)]
+	return rf.log[:rf.actual(end)]
 }
 
 func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
@@ -105,47 +105,45 @@ func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
 
 	next := rf.nextIndex[id]
 	var entries []Entry
-	m := 1
 
-	if len(rf.log) > 1 {
-		m = min(rf.getActual(next), rf.lastLogIndex())
-		entries = append(entries, rf.log[m:]...)
-	}
+	entries = append(entries, rf.log[rf.actual(next):]...)
+
 	DPrintf("args entries to %d: logical index = %d, len = %d, match = %d, next = %d\n",
-		id, rf.getLogical(m), len(entries), rf.matchIndex[id], rf.nextIndex[id])
+		id, next, len(entries), rf.matchIndex[id], next)
 
 	return &AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
 		Entries:      entries,
-		PrevLogIndex: rf.getLogical(m - 1),
-		PrevLogTerm:  rf.log[m-1].Term,
+		PrevLogIndex: next - 1,
+		PrevLogTerm:  rf.log[rf.actual(next-1)].Term,
 		LeaderCommit: rf.commitIndex,
 	}
 }
 
-func (rf *Raft) applyMsg(applyID int) ApplyMsg {
+func (rf *Raft) applyMsg(applyId int) ApplyMsg {
 	return ApplyMsg{
 		CommandValid: true,
-		Command:      rf.log[rf.getActual(applyID)].Command,
-		CommandIndex: applyID,
+		Command:      rf.log[rf.actual(applyId)].Command,
+		CommandIndex: applyId,
 	}
 }
 
-func (rf *Raft) UpdateIndex(id, replicateIdx int) {
+func (rf *Raft) UpdateIndex(id, nextIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.nextIndex[id] = replicateIdx
-	rf.matchIndex[id] = rf.nextIndex[id] - 1
-	DPrintf("leader %v update peer %v 's nextxIndex = %v, CurrentTerm= %v\n", rf.me, id, replicateIdx, rf.currentTerm)
+	rf.nextIndex[id] = nextIndex
+	rf.matchIndex[id] = nextIndex - 1
+	DPrintf("leader %v update peer %v's nextxIndex = %v, CurrentTerm= %v\n",
+		rf.me, id, nextIndex, rf.currentTerm)
 }
 
 func (rf *Raft) UpdateCommit() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	for i := rf.getLogical(rf.lastLogIndex()); i > rf.commitIndex && rf.log[rf.getActual(i)].Term == rf.currentTerm; i-- {
+	for i := rf.logical(rf.lastLogIndex()); i > rf.commitIndex && rf.log[rf.actual(i)].Term == rf.currentTerm; i-- {
 		count := 0
 		for id, idx := range rf.matchIndex {
 			if id == rf.me || idx >= i {
@@ -154,7 +152,8 @@ func (rf *Raft) UpdateCommit() {
 			if count > len(rf.peers)/2 {
 				rf.commitIndex = i
 				rf.applyCond.Signal()
-				DPrintf("leader %d update commitIndex = %v, CurrentTerm = %d, lastApplyId = %d, lastLog = %v\n", rf.me, rf.commitIndex, rf.currentTerm, rf.lastApplied, rf.log[rf.lastLogIndex()])
+				DPrintf("leader %d update commitIndex = %v, CurrentTerm = %d, lastApplyId = %d, lastLog = %v\n",
+					rf.me, rf.commitIndex, rf.currentTerm, rf.lastApplied, rf.log[rf.lastLogIndex()])
 				return
 			}
 		}
@@ -165,18 +164,10 @@ func (rf *Raft) DecreaseNextIndex(id int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// rf.nextIndex[id] = rf.nextIndex[id] - (rf.nextIndex[id]-rf.matchIndex[id])/2 - 1
-	// if rf.nextIndex[id] <= rf.matchIndex[id] {
-	// 	rf.nextIndex[id] = rf.matchIndex[id] + 1
-	// }
-	rf.nextIndex[id] = rf.matchIndex[id] + 1
-}
-
-func (rf *Raft) ConvertRole(argsTerm int) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	return rf.convertRole(argsTerm)
+	rf.nextIndex[id] = rf.nextIndex[id] - (rf.nextIndex[id]-rf.matchIndex[id])/2 - 1
+	if rf.nextIndex[id] <= rf.matchIndex[id] {
+		rf.nextIndex[id] = rf.matchIndex[id] + 1
+	}
 }
 
 func (rf *Raft) convertRole(argsTerm int) bool {
@@ -199,7 +190,7 @@ func (rf *Raft) nextInitial() {
 		if id == rf.me {
 			continue
 		}
-		rf.nextIndex[id] = rf.getLogical(rf.lastLogIndex()) + 1
+		rf.nextIndex[id] = rf.logical(rf.lastLogIndex()) + 1
 	}
 }
 
@@ -209,7 +200,7 @@ func (rf *Raft) matchInitial() {
 	}
 }
 
-func (rf *Raft) canElection() bool {
+func (rf *Raft) canElect() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -218,10 +209,23 @@ func (rf *Raft) canElection() bool {
 	return shouldElection
 }
 
-func (rf *Raft) getLogical(index int) int {
-	return index + rf.snapShotIndex
+func (rf *Raft) logical(index int) int {
+	return index + rf.snapshotIndex
 }
 
-func (rf *Raft) getActual(index int) int {
-	return index - rf.snapShotIndex
+func (rf *Raft) actual(index int) int {
+	return index - rf.snapshotIndex
+}
+
+func (rf *Raft) updateLog(args *AppendEntriesArgs) {
+	rf.log = rf.truncateLog(args.PrevLogIndex + 1)
+	rf.log = append(rf.log, args.Entries...)
+	rf.persist()
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(rf.logical(rf.lastLogIndex()), args.LeaderCommit)
+		rf.applyCond.Signal()
+		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d\n",
+			rf.me, rf.commitIndex, rf.lastApplied)
+	}
 }
