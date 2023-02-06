@@ -11,3 +11,5 @@ mrtmp.*
 /main/mrsequential
 /main/mrworker
 /raft/*.log
+/raft/test_test.go
+/raft/config.go

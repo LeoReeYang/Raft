@@ -117,15 +117,6 @@ func (rf *Raft) persist() {
 	e.Encode(rf.log)
 	raft := w.Bytes()
 	rf.persister.SaveRaftState(raft)
-
-	// w = new(bytes.Buffer)
-	// e = labgob.NewEncoder(w)
-	// e.Encode(rf.log)
-	// snapshot := w.Bytes()
-	// rf.persister.SaveStateAndSnapshot(raft, snapshot)
-
-	// DPrintf("			%d persist raft state, currentTerm = %v ,votedFor = %v, log = %v\n",
-	// 	rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 // restore previously persisted state.
@@ -277,14 +268,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	rf.validAccess = true
+
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.status = Follower
+		rf.votedFor = Null
 		rf.persist()
-		return
 	}
 
-	rf.validAccess = true
 	if !rf.containLog(args.PrevLogTerm, args.PrevLogIndex) {
 		return
 	}
@@ -297,7 +289,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(rf.getLogical(rf.lastLogIndex()), args.LeaderCommit)
 		rf.applyCond.Signal()
-		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d, \n\t\tlog = %v\n", rf.me, rf.commitIndex, rf.lastApplied, rf.log)
+		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d\n", rf.me, rf.commitIndex, rf.lastApplied)
 	}
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -400,7 +392,8 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.persist()
 	args := rf.requestVoteArgs()
-	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n", rf.me, rf.currentTerm, rf.log[rf.getActual(rf.lastLogIndex())].Term, rf.getLogical(rf.lastLogIndex()))
+	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n",
+		rf.me, rf.currentTerm, rf.log[rf.getActual(rf.lastLogIndex())].Term, rf.getLogical(rf.lastLogIndex()))
 	rf.mu.Unlock()
 
 	votesChan := make(chan bool, len(rf.peers))
@@ -422,7 +415,7 @@ func (rf *Raft) startElection() {
 			rf.mu.Lock()
 			if rf.convertRole(reply.Term) {
 				rf.persist()
-				DPrintf("\t\t%v change term = %v, due to higher Term during election\n", rf.me, reply.Term)
+				// DPrintf("\t\t%v change term = %v, due to higher Term during election\n", rf.me, reply.Term)
 				rf.mu.Unlock()
 				return
 			}
@@ -479,7 +472,6 @@ func (rf *Raft) heartbeat() {
 			rf.mu.Lock()
 			if rf.convertRole(reply.Term) {
 				rf.persist()
-				DPrintf("leader %v conver to follower when got heartbeat, term = %v", rf.me, reply.Term)
 				rf.mu.Unlock()
 				return
 			}
@@ -488,7 +480,7 @@ func (rf *Raft) heartbeat() {
 			if reply.Success {
 				rf.UpdateIndex(serverID, args.PrevLogIndex+1+len(args.Entries))
 				rf.UpdateCommit()
-				rf.applyCond.Signal()
+				// rf.applyCond.Signal()
 			} else {
 				rf.DecreaseNextIndex(serverID)
 			}
@@ -546,7 +538,7 @@ func (rf *Raft) applyLog(applyid int) bool {
 
 	select {
 	case rf.applyCh <- msg:
-		DPrintf("\t\t%v apply a msg ,term = %d, applyLog = %v, applyIndx = %d\nlog = %v\n", rf.me, rf.currentTerm, rf.log[rf.getActual(msg.CommandIndex)], msg.CommandIndex, rf.log)
+		DPrintf("\t\t%v apply a msg ,term = %d, applyLog = %v, applyIndx = %d\n", rf.me, rf.currentTerm, rf.log[rf.getActual(msg.CommandIndex)], msg.CommandIndex)
 		return true
 	case <-timer.C:
 		return false
