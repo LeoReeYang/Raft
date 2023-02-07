@@ -80,6 +80,7 @@ type Raft struct {
 	validAccess     bool
 	electionTicker  *time.Ticker
 	heartbeatTicker *time.Ticker
+	snapshotTicker  *time.Ticker
 	applyCond       *sync.Cond
 }
 
@@ -156,6 +157,26 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	log := make([]Entry, 1)
+	log[0].Term = lastIncludedTerm
+	rf.log = log
+
+	rf.snapshotIndex = lastIncludedIndex
+	rf.persister.snapshot = snapshot
+
+	msg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  lastIncludedTerm,
+		SnapshotIndex: lastIncludedIndex,
+	}
+	rf.mu.Unlock()
+	rf.applyCh <- msg
+	rf.mu.Lock()
 
 	return true
 }
@@ -176,8 +197,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	log = append(log, rf.log[actual+1:]...)
 	rf.log = log
 	rf.snapshotIndex = index
+	rf.persister.snapshot = snapshot
 	rf.persist()
-	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimmed log :%v", rf.me, index, rf.log[0], rf.log)
+	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimmed log :%v", rf.me, index, log[0], rf.log)
 }
 
 type InstallSnapshotArgs struct {
@@ -185,14 +207,68 @@ type InstallSnapshotArgs struct {
 	LeaderId          int
 	LastIncludedIndex int
 	LastIncludedTerm  int
-	Data              []Entry
+	Data              []byte
 }
 type InstallSnapshotReply struct {
 	Term    int
 	Success bool
 }
 
-func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {}
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+	reply.Success = false
+	if args.Term < rf.currentTerm {
+		return
+	}
+	rf.validAccess = true
+	if args.LastIncludedIndex <= rf.snapshotIndex {
+		return
+	}
+
+	if rf.convertRole(args.Term) {
+		rf.persist()
+	}
+	snapshotIndex := args.LastIncludedIndex
+	snapshotTerm := args.LastIncludedTerm
+
+	log := make([]Entry, 1)
+	log[0].Term = snapshotTerm
+	rf.snapshotIndex = snapshotIndex
+
+	if snapshotIndex < rf.logical(rf.lastLogIndex()) {
+		log = append(log, rf.log[rf.actual(snapshotIndex+1):]...)
+	}
+	rf.log = log
+	rf.persister.snapshot = clone(args.Data)
+
+	if snapshotIndex > rf.commitIndex {
+		rf.commitIndex = snapshotIndex
+	}
+	if snapshotIndex > rf.lastApplied {
+		rf.lastApplied = snapshotIndex
+	}
+	reply.Success = true
+
+	DPrintf("\t\t%d update snapindex = %d, term = %d,\nlog = %v", rf.me, snapshotIndex, snapshotTerm, rf.log)
+	msg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      clone(args.Data),
+		SnapshotTerm:  snapshotTerm,
+		SnapshotIndex: snapshotIndex,
+	}
+	rf.mu.Unlock()
+	rf.applyCh <- msg
+	rf.mu.Lock()
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
 
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
@@ -241,7 +317,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v]\n",
-		rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.actual(rf.lastLogIndex())].Term, rf.logical(rf.lastLogIndex()))
+		rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.lastLogIndex()].Term, rf.logical(rf.lastLogIndex()))
 }
 
 type AppendEntriesArgs struct {
@@ -378,7 +454,7 @@ func (rf *Raft) startElection() {
 	rf.persist()
 	args := rf.requestVoteArgs()
 	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n",
-		rf.me, rf.currentTerm, rf.log[rf.actual(rf.lastLogIndex())].Term, rf.logical(rf.lastLogIndex()))
+		rf.me, rf.currentTerm, rf.log[rf.lastLogIndex()].Term, rf.logical(rf.lastLogIndex()))
 	rf.mu.Unlock()
 
 	votesChan := make(chan bool, len(rf.peers))
@@ -448,6 +524,9 @@ func (rf *Raft) heartbeat() {
 		}
 		go func(serverId int) {
 			args := rf.AppendEntriesArgs(term, serverId)
+			if args == nil {
+				return
+			}
 			reply := &AppendEntriesReply{}
 
 			if ok := rf.sendAppendEntries(serverId, args, reply); !ok {
@@ -491,6 +570,10 @@ func (rf *Raft) ticker() {
 			if rf.GetStatus() == Leader {
 				go rf.heartbeat()
 			}
+		case <-rf.snapshotTicker.C:
+			if rf.GetStatus() == Leader {
+				go rf.snapshot()
+			}
 		}
 	}
 }
@@ -501,6 +584,7 @@ func (rf *Raft) applyLogs() {
 	go func() {
 		for {
 			rf.applyCond.Wait()
+			DPrintf("\t\t\t%d applied = %d, commit = %d\n", rf.me, rf.lastApplied, rf.commitIndex)
 			for rf.lastApplied < rf.commitIndex {
 				if !rf.applyLog(rf.lastApplied + 1) {
 					rf.mu.Unlock()
@@ -526,7 +610,54 @@ func (rf *Raft) applyLog(applyid int) bool {
 			rf.me, rf.currentTerm, rf.log[rf.actual(msg.CommandIndex)], msg.CommandIndex)
 		return true
 	case <-timer.C:
+		DPrintf("\t\t\t%v can't apply msg :%+v...\n", rf.me, msg)
 		return false
+	}
+}
+
+func (rf *Raft) snapshot() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	snapshot := rf.persister.ReadSnapshot()
+	index := rf.snapshotIndex
+	term := rf.log[0].Term
+
+	args := &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: index,
+		LastIncludedTerm:  term,
+		Data:              snapshot,
+	}
+
+	for id := range rf.nextIndex {
+		if id == rf.me {
+			continue
+		}
+		id := id
+		go func() {
+			reply := &InstallSnapshotReply{}
+			DPrintf("\t\t%d send installsnapshot to %d, lastIndex = %d, term = %d\n", rf.me, id, index, term)
+			if ok := rf.sendInstallSnapshot(id, args, reply); !ok {
+				DPrintf("leader %d send installsnapshot to %d failed\n", rf.me, id)
+				return
+			}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.convertRole(reply.Term) {
+				rf.persist()
+				return
+			}
+
+			if reply.Success {
+				rf.matchIndex[id] = index
+				rf.nextIndex[id] = index + 1
+				DPrintf("\t\t%d install snapshot ok, next = %d, match = %d\n", id, index+1, index)
+			}
+		}()
+
 	}
 }
 
@@ -559,6 +690,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.electionTicker = time.NewTicker(GetRandomTime())
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
+	rf.snapshotTicker = time.NewTicker(250 * time.Millisecond)
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.snapshotIndex = 0
 

@@ -7,7 +7,7 @@ import (
 )
 
 // Debugging
-const Debug = false
+const Debug = true
 
 const (
 	BaseIntervalTime int = 650
@@ -104,19 +104,23 @@ func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
 	defer rf.mu.Unlock()
 
 	next := rf.nextIndex[id]
+	actual := rf.actual(next)
 	var entries []Entry
 
-	entries = append(entries, rf.log[rf.actual(next):]...)
+	if actual <= 0 {
+		return nil
+	}
 
-	DPrintf("args entries to %d: logical index = %d, len = %d, match = %d, next = %d\n",
-		id, next, len(entries), rf.matchIndex[id], next)
+	entries = append(entries, rf.log[actual:]...)
 
+	DPrintf("args entries to %d: logical index = %d, len = %d, match = %d, actual next = %d\n,log = %v",
+		id, next, len(entries), rf.matchIndex[id], actual, entries)
 	return &AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
 		Entries:      entries,
 		PrevLogIndex: next - 1,
-		PrevLogTerm:  rf.log[rf.actual(next-1)].Term,
+		PrevLogTerm:  rf.log[actual-1].Term,
 		LeaderCommit: rf.commitIndex,
 	}
 }
@@ -167,7 +171,11 @@ func (rf *Raft) DecreaseNextIndex(id int) {
 	rf.nextIndex[id] = rf.nextIndex[id] - (rf.nextIndex[id]-rf.matchIndex[id])/2 - 1
 	if rf.nextIndex[id] <= rf.matchIndex[id] {
 		rf.nextIndex[id] = rf.matchIndex[id] + 1
+		if rf.snapshotIndex > rf.matchIndex[id] {
+			rf.nextIndex[id] = rf.snapshotIndex + 1
+		}
 	}
+
 }
 
 func (rf *Raft) convertRole(argsTerm int) bool {
