@@ -26,6 +26,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+
 	"6.824/labgob"
 	"6.824/labrpc"
 )
@@ -157,27 +158,6 @@ func (rf *Raft) readPersist(data []byte) {
 func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
 
 	// Your code here (2D).
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	log := make([]Entry, 1)
-	log[0].Term = lastIncludedTerm
-	rf.log = log
-
-	rf.snapshotIndex = lastIncludedIndex
-	rf.persister.snapshot = snapshot
-
-	msg := ApplyMsg{
-		CommandValid:  false,
-		SnapshotValid: true,
-		Snapshot:      snapshot,
-		SnapshotTerm:  lastIncludedTerm,
-		SnapshotIndex: lastIncludedIndex,
-	}
-	rf.mu.Unlock()
-	rf.applyCh <- msg
-	rf.mu.Lock()
-
 	return true
 }
 
@@ -190,16 +170,33 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	log := make([]Entry, 1)
-	actual := rf.actual(index)
-	log[0] = rf.log[actual]
+	term := rf.log[rf.actual(index)].Term
 
-	log = append(log, rf.log[actual+1:]...)
+	log := make([]Entry, 0)
+	log = append(log, rf.log[rf.actual(index):]...)
 	rf.log = log
+
+	// DPrintf("%d before trime, next=%d, actual=%d 	log :%v\n", rf.me, index, actual, rf.log)
 	rf.snapshotIndex = index
 	rf.persister.snapshot = snapshot
 	rf.persist()
-	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimmed log :%v", rf.me, index, log[0], rf.log)
+
+	go func(term, index int) {
+		// time.Sleep(100 * time.Millisecond)
+		// rf.mu.Lock()
+		// defer rf.mu.Unlock()
+		msg := ApplyMsg{
+			CommandValid:  false,
+			SnapshotValid: true,
+			Snapshot:      clone(snapshot),
+			SnapshotTerm:  term,
+			SnapshotIndex: index,
+		}
+		// rf.mu.Unlock()
+		rf.applyCh <- msg
+		// rf.mu.Lock()
+	}(term, index)
+	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimmed log :%v", rf.me, index, rf.log[0], log)
 }
 
 type InstallSnapshotArgs struct {
@@ -227,22 +224,27 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.LastIncludedIndex <= rf.snapshotIndex {
 		return
 	}
+	// DPrintf("\t\t%d's original snapshotIndex = %d\n", rf.me, rf.snapshotIndex)
+	// DPrintf("\t\t%d's untrimmed log = %v\n", rf.me, rf.log)
 
 	if rf.convertRole(args.Term) {
 		rf.persist()
 	}
+	rf.persister.snapshot = clone(args.Data)
+
 	snapshotIndex := args.LastIncludedIndex
 	snapshotTerm := args.LastIncludedTerm
 
-	log := make([]Entry, 1)
-	log[0].Term = snapshotTerm
-	rf.snapshotIndex = snapshotIndex
-
+	var log []Entry
 	if snapshotIndex < rf.logical(rf.lastLogIndex()) {
-		log = append(log, rf.log[rf.actual(snapshotIndex+1):]...)
+		log = append(log, rf.log[rf.actual(snapshotIndex):]...)
+	} else {
+		log = append(log, Entry{Term: snapshotTerm})
 	}
 	rf.log = log
-	rf.persister.snapshot = clone(args.Data)
+
+	rf.snapshotIndex = snapshotIndex
+	DPrintf("\t\t%d's trimmed log = %v\n", rf.me, rf.log)
 
 	if snapshotIndex > rf.commitIndex {
 		rf.commitIndex = snapshotIndex
@@ -252,7 +254,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	reply.Success = true
 
-	DPrintf("\t\t%d update snapindex = %d, term = %d,\nlog = %v", rf.me, snapshotIndex, snapshotTerm, rf.log)
+	// DPrintf("\t\t%d update snapindex = %d, term = %d,\nlog = %v", rf.me, snapshotIndex, snapshotTerm, rf.log)
 	msg := ApplyMsg{
 		CommandValid:  false,
 		SnapshotValid: true,
@@ -316,8 +318,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("\t\t%v votedFor = %v, term = %d, persisted...\n", rf.me, args.CandidateId, rf.currentTerm)
 		return
 	}
-	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v]\n",
-		rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.lastLogIndex()].Term, rf.logical(rf.lastLogIndex()))
+	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v],\nlog = %v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.lastLogIndex()].Term, rf.logical(rf.lastLogIndex()), rf.log)
 }
 
 type AppendEntriesArgs struct {

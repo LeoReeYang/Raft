@@ -164,6 +164,7 @@ func (cfg *config) checkLogs(i int, m ApplyMsg) (string, bool) {
 // contents
 func (cfg *config) applier(i int, applyCh chan ApplyMsg) {
 	for m := range applyCh {
+		// DPrintf("\t\t\ttester get a applier message :%+v.....\n", m)
 		if m.CommandValid == false {
 			// ignore other types of ApplyMsg
 		} else {
@@ -223,6 +224,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 
 	for m := range applyCh {
 		err_msg := ""
+		// DPrintf("\t\t\tpeer %v get a applierSnap message := %+v......\n", i, m)
 		if m.SnapshotValid {
 			if rf.CondInstallSnapshot(m.SnapshotTerm, m.SnapshotIndex, m.Snapshot) {
 				cfg.mu.Lock()
@@ -248,6 +250,8 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 			cfg.lastApplied[i] = m.CommandIndex
 			cfg.mu.Unlock()
 
+			// DPrintf("\t\t\t%d 's commitIndex = %d...\n", i, m.CommandIndex)
+
 			if (m.CommandIndex+1)%SnapShotInterval == 0 {
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
@@ -257,6 +261,7 @@ func (cfg *config) applierSnap(i int, applyCh chan ApplyMsg) {
 					xlog = append(xlog, cfg.logs[i][j])
 				}
 				e.Encode(xlog)
+				// DPrintf("\t\t\t%d's commmit = 9... call Sanpshot...\n", i)
 				rf.Snapshot(m.CommandIndex, w.Bytes())
 			}
 		} else {

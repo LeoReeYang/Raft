@@ -71,8 +71,13 @@ func (rf *Raft) candidateNewer(lastLogTerm, lastLogIndex int) bool {
 
 func (rf *Raft) containLog(term, index int) bool {
 	lastLogIndex := rf.logical(rf.lastLogIndex())
+	DPrintf("\t\t%d call cantainLog, index = %d, snapshotIndex = %d, actual = %d\n", rf.me, index, rf.snapshotIndex, rf.actual(index))
 
-	return index <= lastLogIndex && term == rf.log[rf.actual(index)].Term
+	if index < rf.snapshotIndex {
+		return false
+	}
+
+	return index <= lastLogIndex && term == rf.log[rf.actual(index)].Term // out of range?
 }
 
 func (rf *Raft) appendLog(command interface{}) (index int) {
