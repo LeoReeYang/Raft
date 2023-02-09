@@ -112,14 +112,20 @@ func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
 	actual := rf.actual(next)
 	var entries []Entry
 
+	// for follower fall so far behind, send a heartbeat
 	if actual <= 0 {
-		return nil
+		// next = rf.logical(rf.lastLogIndex()) + 1
+		// actual = rf.lastLogIndex() + 1
+		next = rf.snapshotIndex + 1
+		actual = 1
 	}
+
+	// DPrintf("leader %d AE to %d, next = %d, snapshotIndex = %d, actual = %d\n", rf.me, id, next, rf.snapshotIndex, rf.actual(next))
 
 	entries = append(entries, rf.log[actual:]...)
 
-	DPrintf("args entries to %d: logical index = %d, len = %d, match = %d, actual next = %d\n,log = %v",
-		id, next, len(entries), rf.matchIndex[id], actual, entries)
+	// DPrintf("args entries to %d: logical index = %d, len = %d, match = %d, actual next = %d\n,log = %v",
+	// 	id, next, len(entries), rf.matchIndex[id], actual, entries)
 	return &AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
@@ -131,6 +137,7 @@ func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
 }
 
 func (rf *Raft) applyMsg(applyId int) ApplyMsg {
+	// DPrintf("\t\t%d try to apply index = %d, commitIndex = %d, lastApplied = %d\n", rf.me, applyId, rf.commitIndex, rf.lastApplied)
 	return ApplyMsg{
 		CommandValid: true,
 		Command:      rf.log[rf.actual(applyId)].Command,
@@ -144,8 +151,8 @@ func (rf *Raft) UpdateIndex(id, nextIndex int) {
 
 	rf.nextIndex[id] = nextIndex
 	rf.matchIndex[id] = nextIndex - 1
-	DPrintf("leader %v update peer %v's nextxIndex = %v, CurrentTerm= %v\n",
-		rf.me, id, nextIndex, rf.currentTerm)
+	// DPrintf("leader %v update peer %v's nextxIndex = %v, CurrentTerm= %v\n",
+	// 	rf.me, id, nextIndex, rf.currentTerm)
 }
 
 func (rf *Raft) UpdateCommit() {
@@ -169,7 +176,7 @@ func (rf *Raft) UpdateCommit() {
 	}
 }
 
-func (rf *Raft) DecreaseNextIndex(id int) {
+func (rf *Raft) DecreaseNext(id int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -213,7 +220,7 @@ func (rf *Raft) matchInitial() {
 	}
 }
 
-func (rf *Raft) canElect() bool {
+func (rf *Raft) CanElect() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -235,10 +242,31 @@ func (rf *Raft) updateLog(args *AppendEntriesArgs) {
 	rf.log = append(rf.log, args.Entries...)
 	rf.persist()
 
+	DPrintf("\t\t%d after update log : %v\n", rf.me, rf.log)
+
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(rf.logical(rf.lastLogIndex()), args.LeaderCommit)
 		rf.applyCond.Signal()
 		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d\n",
 			rf.me, rf.commitIndex, rf.lastApplied)
+	}
+}
+
+func snapshotMsg(snapshot []byte, term, index int) *ApplyMsg {
+	return &ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      snapshot,
+		SnapshotTerm:  term,
+		SnapshotIndex: index,
+	}
+}
+
+func (rf *Raft) InstallSnapshotArgs() *InstallSnapshotArgs {
+	return &InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LastIncludedIndex: rf.snapshotIndex,
+		LastIncludedTerm:  rf.log[0].Term,
+		Data:              rf.persister.ReadSnapshot(),
 	}
 }
