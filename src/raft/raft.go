@@ -68,21 +68,23 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm     int
-	votedFor        int
-	log             []Entry
-	commitIndex     int
-	lastApplied     int
-	nextIndex       []int
-	matchIndex      []int
-	snapshotIndex   int
-	status          Status
-	applyCh         chan ApplyMsg
-	validAccess     bool
-	electionTicker  *time.Ticker
-	heartbeatTicker *time.Ticker
-	snapshotTicker  *time.Ticker
-	applyCond       *sync.Cond
+	currentTerm       int
+	votedFor          int
+	log               []Entry
+	commitIndex       int
+	lastApplied       int
+	nextIndex         []int
+	matchIndex        []int
+	status            Status
+	applyCh           chan ApplyMsg
+	validAccess       bool
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	electionTicker    *time.Ticker
+	heartbeatTicker   *time.Ticker
+	snapshotTicker    *time.Ticker
+	applyCond         *sync.Cond
+	applyChan         chan int
 }
 
 // return currentTerm and whether this server
@@ -117,7 +119,8 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	e.Encode(rf.snapshotIndex)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	raft := w.Bytes()
 	rf.persister.SaveRaftState(raft)
 }
@@ -145,15 +148,17 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var votedFor int
 	var log []Entry
-	var snapshotIndex int
-	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&snapshotIndex) != nil {
+	var lastIncludedIndex, lastIncludedTerm int
+	if d.Decode(&term) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil ||
+		d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
 		return
 	} else {
+		rf.log = log
 		rf.currentTerm = term
 		rf.votedFor = votedFor
-		rf.log = log
-		rf.snapshotIndex = snapshotIndex
-		rf.lastApplied = snapshotIndex
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		rf.lastApplied = lastIncludedIndex
 	}
 }
 
@@ -173,26 +178,29 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
-	term := rf.log[rf.actual(index)].Term
+	actual := rf.actual(index)
+	term := rf.log[actual].Term
+	copy := clone(snapshot)
+	rf.persister.snapshot = copy
 
-	log := make([]Entry, 0)
-	log = append(log, rf.log[rf.actual(index):]...)
+	// Debug("\t\t%d original log = %v, last = %d, acutal = %d\n", rf.me, rf.log, rf.lastLogIndex(), rf.actual(index+1))
+	Debug(dSnap, "S%d trime at %d, last = %d, log = %v", rf.me, index, rf.lastLogIndex(), rf.log)
+
+	log := make([]Entry, 1)
+	log = append(log, rf.log[actual+1:]...)
 	rf.log = log
 
-	rf.snapshotIndex = index
-	rf.persister.snapshot = snapshot
-	rf.persist()
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = term
 
-	go func(term, index int) {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
+	go func(term, index int, snapshot []byte) {
+		rf.applyCh <- *snapshotMsg(snapshot, term, index)
+	}(term, index, copy)
 
-		rf.mu.Unlock()
-		rf.applyCh <- *snapshotMsg(clone(snapshot), term, index)
-		rf.mu.Lock()
-	}(term, index)
-	DPrintf("%v called by Snapshot, index = %d, log[0] = %+v, \n\t\ttrimmed log :%v", rf.me, index, rf.log[0], log)
+	// Debug("\t\t%v called by Snapshot, lastIncludeIndex = %d term = %d, \n\t\ttrimmed log :%v", rf.me, index, term, rf.log)
+	Debug(dSnap, "S%d lastInclude = %d, trimmed log = %v", rf.me, rf.lastIncludedIndex, rf.log)
 }
 
 type InstallSnapshotArgs struct {
@@ -209,37 +217,32 @@ type InstallSnapshotReply struct {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
-	if args.Term < rf.currentTerm {
+
+	if args.Term < rf.currentTerm || args.LastIncludedTerm < rf.lastIncludedTerm || args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
 
-	rf.persister.snapshot = clone(args.Data)
+	copy := clone(args.Data)
+	rf.persister.snapshot = copy
 	rf.validAccess = true
 
-	if args.LastIncludedIndex <= rf.snapshotIndex {
-		return
-	}
-	if rf.convertRole(args.Term) {
-		rf.persist()
-	}
+	rf.convertRole(args.Term)
 
 	snapshotIndex := args.LastIncludedIndex
 	snapshotTerm := args.LastIncludedTerm
 
-	var log []Entry
+	log := make([]Entry, 1)
 	if snapshotIndex < rf.logical(rf.lastLogIndex()) {
-		log = append(log, rf.log[rf.actual(snapshotIndex):]...)
-	} else {
-		log = append(log, Entry{Term: snapshotTerm})
+		log = append(log, rf.log[rf.actual(snapshotIndex+1):]...)
 	}
-
 	rf.log = log
-	rf.snapshotIndex = snapshotIndex
 
-	rf.persist()
+	rf.lastIncludedIndex = snapshotIndex
+	rf.lastIncludedTerm = snapshotTerm
 
 	if snapshotIndex > rf.commitIndex {
 		rf.commitIndex = snapshotIndex
@@ -249,9 +252,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	reply.Success = true
 
-	// DPrintf("\t\t%d update snapindex = %d, term = %d,\nlog = %v", rf.me, snapshotIndex, snapshotTerm, rf.log)
+	Debug(dSnap, "S%d install snapshot, lastindex = %d, applied = %d, commmit = %d, log = %v",
+		rf.me, rf.lastIncludedIndex, rf.lastApplied, rf.commitIndex, rf.log)
+
+	// go func() {
+	// 	rf.applyCh <- *snapshotMsg(copy, snapshotTerm, snapshotIndex)
+	// }()
+
 	rf.mu.Unlock()
-	rf.applyCh <- *snapshotMsg(clone(args.Data), snapshotTerm, snapshotIndex)
+	rf.applyCh <- *snapshotMsg(copy, snapshotTerm, snapshotIndex)
 	rf.mu.Lock()
 }
 
@@ -284,6 +293,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
@@ -292,9 +302,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.convertRole(args.Term) {
-		rf.persist()
-	}
+	rf.convertRole(args.Term)
 
 	if (rf.votedFor == Null || rf.votedFor == args.CandidateId) &&
 		rf.candidateNewer(args.LastLogTerm, args.LastLogIndex) {
@@ -302,12 +310,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.validAccess = true
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		rf.persist()
-		DPrintf("\t\t%v votedFor = %v, term = %d, persisted...\n", rf.me, args.CandidateId, rf.currentTerm)
+		Debug(dVote, "S%d votedFor = %d, term = %d", rf.me, args.CandidateId, rf.currentTerm)
 		return
 	}
-	DPrintf("\t\t%d not vote, term = %d, votedFor = %d, lastLog[term = %v, index = %v],\nlog = %v",
-		rf.me, rf.currentTerm, rf.votedFor, rf.log[rf.lastLogIndex()].Term, rf.logical(rf.lastLogIndex()), rf.log)
+	Debug(dVote, "S%d not vote, term = %d, votedFor = %d, log = %v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 type AppendEntriesArgs struct {
@@ -326,25 +333,50 @@ type AppendEntriesReply struct {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	reply.Success = false
 	reply.Term = rf.currentTerm
 
+	// ignore the old term vote request
 	if args.Term < rf.currentTerm {
+		return
+	}
+	// we should check the log now...maybe it will be a outdate log...
+	// consider a problem, when we had a fake leader AE, we can't make this AE or hb valied unless it was a up-to-date log leader.
+	// when a voteFor rpc delaied , the disconnect peer back with a election timer fires, then got the delay rpc voteFor, peer becomes
+	// fake leader(not up-to-date log to anyone), then the AE will stop the election timer fires, we will never had a true leader...
+
+	// rf.validAccess = true(we can't flash the validAccess here before we check the log is more up-to-date...)
+
+	// we should check both the term & log, not just term higher make this AE or hb a valid rpc...
+	rf.convertRole(args.Term)
+
+	// if args.PrevLogTerm < rf.lastIncludedTerm || args.PrevLogIndex < rf.commitIndex || args.PrevLogIndex < rf.lastApplied {
+	// 	return
+	// }
+	if args.PrevLogIndex < rf.lastIncludedIndex {
 		return
 	}
 
 	rf.validAccess = true
-
-	if rf.convertRole(args.Term) {
-		rf.persist()
-	}
 	if !rf.containLog(args.PrevLogTerm, args.PrevLogIndex) {
 		return
 	}
 
 	reply.Success = true
-	rf.updateLog(args)
+
+	rf.log = rf.truncateLog(args.PrevLogIndex + 1)
+	rf.log = append(rf.log, args.Entries...)
+
+	Debug(dLog, "S%d after update, log %v", rf.me, rf.log)
+
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(rf.logical(rf.lastLogIndex()), args.LeaderCommit)
+		rf.applyCond.Signal()
+		Debug(dCommit, "S%d follower update commit = %d, lastApplied = %d",
+			rf.me, rf.commitIndex, rf.lastApplied)
+	}
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -410,7 +442,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index = rf.appendLog(command)
 	rf.persist()
-	// DPrintf("leader %v write cmd ={%d %v} to local log,index = %d persisted...\n", rf.me, rf.currentTerm, command, index)
+	Debug(dPersist, "S%d leader write log { %d %v }, index = %d persisted...\n", rf.me, rf.currentTerm, command, index)
 	term = rf.currentTerm
 
 	return index, term, isLeader
@@ -442,8 +474,8 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.persist()
 	args := rf.requestVoteArgs()
-	DPrintf("\t\t%v starts a new election, term = %v, lastLog[term = %v, index = %v], persisted...\n",
-		rf.me, rf.currentTerm, rf.log[rf.lastLogIndex()].Term, rf.logical(rf.lastLogIndex()))
+	Debug(dVote, "S%d starts a new election, term = %d, log = %v",
+		rf.me, rf.currentTerm, rf.log)
 	rf.mu.Unlock()
 
 	votesChan := make(chan bool, len(rf.peers))
@@ -454,24 +486,23 @@ func (rf *Raft) startElection() {
 		}
 
 		go func(serverID int) {
-			reply := RequestVoteReply{}
+			reply := &RequestVoteReply{}
 
-			if ok := rf.sendRequestVote(serverID, args, &reply); !ok {
-				DPrintf("\t\tCandidate %v send RequestVote to %v failed, term = %d\n", args.CandidateId, serverID, args.Term)
+			if ok := rf.sendRequestVote(serverID, args, reply); !ok {
+				Debug(dError, "S%d Candidate send RequestVote -> %d failed, term = %d", args.CandidateId, serverID, args.Term)
 				votesChan <- false
 				return
 			}
 
 			rf.mu.Lock()
-			if rf.convertRole(reply.Term) {
-				rf.persist()
-				// DPrintf("\t\t%v change term = %v, due to higher Term during election\n", rf.me, reply.Term)
-				rf.mu.Unlock()
-				return
-			}
-			rf.mu.Unlock()
+			defer rf.mu.Unlock()
+			defer rf.persist()
 
 			votesChan <- reply.VoteGranted
+
+			if rf.convertRole(reply.Term) {
+				return
+			}
 		}(id)
 	}
 
@@ -488,6 +519,7 @@ func (rf *Raft) startElection() {
 		if rf.status == Candidate {
 			if voteCnt > len(rf.peers)/2 {
 				rf.status = Leader
+				Debug(dLeader, "S%d becomes Leader, term = %d", rf.me, rf.currentTerm)
 				rf.nextInitial()
 				rf.matchInitial()
 				rf.mu.Unlock()
@@ -566,15 +598,13 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) applyLogs() {
 	rf.applyCond.L.Lock()
-
 	go func() {
 		for {
 			rf.applyCond.Wait()
-			// DPrintf("\t\t\t%d applied = %d, commit = %d\n", rf.me, rf.lastApplied, rf.commitIndex)
-			for rf.lastApplied < rf.commitIndex {
+			for rf.lastApplied+1 <= rf.commitIndex {
 				if !rf.applyLog(rf.lastApplied + 1) {
 					rf.mu.Unlock()
-					time.Sleep(200 * time.Millisecond)
+					time.Sleep(100 * time.Millisecond)
 					rf.mu.Lock()
 					continue
 				}
@@ -592,45 +622,43 @@ func (rf *Raft) applyLog(applyid int) bool {
 
 	select {
 	case rf.applyCh <- msg:
-		DPrintf("\t\t%v apply a msg ,term = %d, applyLog = %v, applyIndx = %d\n",
+		Debug(dApply, "S%d apply a msg ok, term = %d, applyLog = %v, applyIndex = %d",
 			rf.me, rf.currentTerm, rf.log[rf.actual(msg.CommandIndex)], msg.CommandIndex)
 		return true
 	case <-timer.C:
-		// DPrintf("\t\t\t%v can't apply msg :%+v...\n", rf.me, msg)
+		Debug(dError, "S%d apply msg: %v timeout...", rf.me, msg)
 		return false
 	}
 }
 
 func (rf *Raft) snapshot() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 
-	args := rf.InstallSnapshotArgs()
-
-	for id := range rf.nextIndex {
+	for id := range rf.peers {
 		if id == rf.me {
 			continue
 		}
 		id := id
 		go func() {
+			args := rf.InstallSnapshotArgs()
+			Debug(dSnap, "S%d try send snapshot -> %d, lastIndex = %d", rf.me, id, args.LastIncludedIndex)
+
 			reply := &InstallSnapshotReply{}
 			if ok := rf.sendInstallSnapshot(id, args, reply); !ok {
-				// DPrintf("leader %d send installsnapshot to %d failed\n", rf.me, id)
+				Debug(dError, "S%d send snapshot -> %d failed...", rf.me, id)
 				return
 			}
 
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+			defer rf.persist()
 
-			if rf.convertRole(reply.Term) {
-				rf.persist()
-				return
-			}
 			if reply.Success {
-				rf.matchIndex[id] = rf.snapshotIndex
-				rf.nextIndex[id] = rf.snapshotIndex + 1
-				// DPrintf("\t\t%d install snapshot ok, next = %d, match = %d\n", id, index+1, index)
+				Debug(dSnap, "S%d send snapshot -> %d ok, update match = %d, next = %d", rf.me, id, rf.lastIncludedIndex, rf.lastIncludedIndex+1)
+				rf.matchIndex[id] = rf.lastIncludedIndex
+				rf.nextIndex[id] = rf.lastIncludedIndex + 1
 			}
+
+			rf.convertRole(reply.Term)
 		}()
 	}
 }
@@ -666,14 +694,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
 	rf.snapshotTicker = time.NewTicker(150 * time.Millisecond)
 	rf.applyCond = sync.NewCond(&rf.mu)
-	rf.snapshotIndex = 0
+	rf.applyChan = make(chan int, 512)
+	rf.lastIncludedIndex = 0
+	rf.lastIncludedTerm = 0
 
 	// initialize from state persisted before a crash
+	// rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
 	rf.persister.snapshot = rf.persister.ReadSnapshot()
-	// rf.lastApplied = rf.snapshotIndex
-	DPrintf("%v read Persist state, Term = %v, VotedFor = %v, lastapplied = %d, Log = %v\n", rf.me, rf.currentTerm, rf.votedFor, rf.lastApplied, rf.log)
+	Debug(dPersist, "S%d read Persist state, Term = %d, VotedFor = %d, lastapplied = %d, Log = %v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.lastApplied, rf.log)
 	// start ticker goroutine to start elections
+	// rf.mu.Unlock()
+
 	go rf.ticker()
 
 	go rf.applyLogs()

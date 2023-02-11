@@ -1137,12 +1137,12 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 
 		if disconnect {
 			cfg.disconnect(victim)
-			DPrintf("\t\t%d disconnect...\n", victim)
+			Debug(dError, "S%d Disconnect...", victim)
 			cfg.one(rand.Int()%servers, servers-1, true)
 		}
 		if crash {
 			cfg.crash1(victim)
-			DPrintf("\t\t%d crash...\n", victim)
+			Debug(dError, "S%d Crash...", victim)
 			cfg.one(rand.Int()%servers, servers-1, true)
 		}
 
@@ -1157,7 +1157,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			// make sure all followers have caught up, so that
 			// an InstallSnapshot RPC isn't required for
 			// TestSnapshotBasic2D().
-			cfg.one(rand.Int(), servers, true)
+			cfg.one(rand.Int()%servers, servers, true)
 		} else {
 			cfg.one(rand.Int()%servers, servers-1, true)
 		}
@@ -1169,14 +1169,14 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			// reconnect a follower, who maybe behind and
 			// needs to rceive a snapshot to catch up.
 			cfg.connect(victim)
-			DPrintf("\t\t%d connect...\n", victim)
+			Debug(dClient, "S%d Connected...", victim)
 			cfg.one(rand.Int()%servers, servers, true)
 			leader1 = cfg.checkOneLeader()
 		}
 		if crash {
 			cfg.start1(victim, cfg.applierSnap)
 			cfg.connect(victim)
-			DPrintf("\t\t%d restart and connnect...\n", victim)
+			Debug(dClient, "S%d Restart and Connnected...", victim)
 			cfg.one(rand.Int()%servers, servers, true)
 			leader1 = cfg.checkOneLeader()
 		}

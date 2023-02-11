@@ -1,18 +1,8 @@
 package raft
 
 import (
-	"log"
 	"math/rand"
 	"time"
-)
-
-// Debugging
-const Debug = true
-
-const (
-	BaseIntervalTime int = 650
-	RandomTimeValue  int = 150
-	Null             int = -1
 )
 
 type Status int
@@ -23,13 +13,11 @@ const (
 	Leader
 )
 
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-		log.Printf(format, a...)
-	}
-	return
-}
+const (
+	BaseIntervalTime int = 650
+	RandomTimeValue  int = 150
+	Null             int = -1
+)
 
 func min(a, b int) int {
 	if a < b {
@@ -66,15 +54,24 @@ func (rf *Raft) GetCurrentTerm() int {
 
 func (rf *Raft) candidateNewer(lastLogTerm, lastLogIndex int) bool {
 	myLastTerm := rf.log[rf.lastLogIndex()].Term
+
+	Debug(dVote, "S%d compare log, lastlogTerm = %d, index = %d;candidate: T = %d, idx = %d",
+		rf.me, myLastTerm, rf.logical(rf.lastLogIndex()), lastLogTerm, lastLogIndex)
+
 	return lastLogTerm > myLastTerm || lastLogTerm == myLastTerm && lastLogIndex >= rf.logical(rf.lastLogIndex())
 }
 
 func (rf *Raft) containLog(term, index int) bool {
 	lastLogIndex := rf.logical(rf.lastLogIndex())
-	DPrintf("\t\t%d call cantainLog, index = %d, snapshotIndex = %d, actual = %d\n", rf.me, index, rf.snapshotIndex, rf.actual(index))
+	Debug(dLog, "S%d check target = %d, lastInclude = %d, actual = %d, lastlogindex = %d, log = %v",
+		rf.me, index, rf.lastIncludedIndex, rf.actual(index), rf.logical(rf.lastLogIndex()), rf.log)
 
-	if index < rf.snapshotIndex {
+	if index < rf.lastIncludedIndex {
 		return false
+	}
+
+	if index == rf.lastIncludedIndex {
+		return true
 	}
 
 	return index <= lastLogIndex && term == rf.log[rf.actual(index)].Term // out of range?
@@ -110,34 +107,46 @@ func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
 
 	next := rf.nextIndex[id]
 	actual := rf.actual(next)
-	var entries []Entry
+	entries := make([]Entry, 0)
 
-	// for follower fall so far behind, send a heartbeat
-	if actual <= 0 {
-		// next = rf.logical(rf.lastLogIndex()) + 1
-		// actual = rf.lastLogIndex() + 1
-		next = rf.snapshotIndex + 1
-		actual = 1
-	}
-
-	// DPrintf("leader %d AE to %d, next = %d, snapshotIndex = %d, actual = %d\n", rf.me, id, next, rf.snapshotIndex, rf.actual(next))
-
-	entries = append(entries, rf.log[actual:]...)
-
-	// DPrintf("args entries to %d: logical index = %d, len = %d, match = %d, actual next = %d\n,log = %v",
-	// 	id, next, len(entries), rf.matchIndex[id], actual, entries)
-	return &AppendEntriesArgs{
+	args := &AppendEntriesArgs{
 		Term:         term,
 		LeaderId:     rf.me,
-		Entries:      entries,
-		PrevLogIndex: next - 1,
-		PrevLogTerm:  rf.log[actual-1].Term,
 		LeaderCommit: rf.commitIndex,
 	}
+
+	// for follower fall so far behind, send a heartbeat
+	// if actual < 1 {
+	// 	args.Entries = entries
+	// 	args.PrevLogIndex = rf.logical(rf.lastLogIndex())
+	// 	args.PrevLogTerm = rf.log[rf.lastLogIndex()].Term
+
+	// 	Debug(dLog, "S%d leader heartbeat to %d, due to fall behind..., next = %d, lastInclude = %d, actual = %d",
+	// 		rf.me, id, rf.nextIndex[id], rf.lastIncludedIndex, actual)
+	// 	return args
+	// }
+
+	if actual < 1 {
+		entries = append(entries, rf.log[1:]...)
+		args.Entries = entries
+		args.PrevLogIndex = rf.lastIncludedIndex
+		args.PrevLogTerm = rf.lastIncludedTerm
+		Debug(dLog, "S%d leader heartbeat -> %d, due to fall behind..., next = %d, lastInclude = %d, actual = %d, log = %v",
+			rf.me, id, rf.nextIndex[id], rf.lastIncludedIndex, actual, entries)
+		return args
+	}
+
+	entries = append(entries, rf.log[actual:]...)
+	args.Entries = entries
+	args.PrevLogIndex = next - 1
+	args.PrevLogTerm = rf.log[actual-1].Term
+	Debug(dLog2, "S%d leader copy log -> %d, PrevId = %d, PrevT = %d, log = %v", rf.me, id, next-1, rf.log[actual-1].Term, entries)
+	return args
 }
 
 func (rf *Raft) applyMsg(applyId int) ApplyMsg {
-	// DPrintf("\t\t%d try to apply index = %d, commitIndex = %d, lastApplied = %d\n", rf.me, applyId, rf.commitIndex, rf.lastApplied)
+	Debug(dApply, "S%d try to apply index = %d, commitIndex = %d, lastApplied = %d, lastInclude = %d",
+		rf.me, applyId, rf.commitIndex, rf.lastApplied, rf.lastIncludedIndex)
 	return ApplyMsg{
 		CommandValid: true,
 		Command:      rf.log[rf.actual(applyId)].Command,
@@ -145,12 +154,12 @@ func (rf *Raft) applyMsg(applyId int) ApplyMsg {
 	}
 }
 
-func (rf *Raft) UpdateIndex(id, nextIndex int) {
+func (rf *Raft) UpdateIndex(id, next int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.nextIndex[id] = nextIndex
-	rf.matchIndex[id] = nextIndex - 1
+	rf.nextIndex[id] = next
+	rf.matchIndex[id] = next - 1
 	// DPrintf("leader %v update peer %v's nextxIndex = %v, CurrentTerm= %v\n",
 	// 	rf.me, id, nextIndex, rf.currentTerm)
 }
@@ -168,8 +177,8 @@ func (rf *Raft) UpdateCommit() {
 			if count > len(rf.peers)/2 {
 				rf.commitIndex = i
 				rf.applyCond.Signal()
-				DPrintf("leader %d update commitIndex = %v, CurrentTerm = %d, lastApplyId = %d, lastLog = %v\n",
-					rf.me, rf.commitIndex, rf.currentTerm, rf.lastApplied, rf.log[rf.lastLogIndex()])
+				Debug(dCommit, "S%d leader update commit = %v, lastApplyId = %d",
+					rf.me, rf.commitIndex, rf.lastApplied)
 				return
 			}
 		}
@@ -180,14 +189,14 @@ func (rf *Raft) DecreaseNext(id int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.nextIndex[id] = rf.nextIndex[id] - (rf.nextIndex[id]-rf.matchIndex[id])/2 - 1
-	if rf.nextIndex[id] <= rf.matchIndex[id] {
-		rf.nextIndex[id] = rf.matchIndex[id] + 1
-		if rf.snapshotIndex > rf.matchIndex[id] {
-			rf.nextIndex[id] = rf.snapshotIndex + 1
+	if rf.matchIndex[id] == 0 {
+		rf.nextIndex[id] = rf.lastIncludedIndex + 1
+	} else {
+		rf.nextIndex[id] = rf.nextIndex[id] - (rf.nextIndex[id]-rf.matchIndex[id])/2 - 1
+		if rf.nextIndex[id] <= rf.matchIndex[id] {
+			rf.nextIndex[id] = rf.matchIndex[id] + 1
 		}
 	}
-
 }
 
 func (rf *Raft) convertRole(argsTerm int) bool {
@@ -230,26 +239,11 @@ func (rf *Raft) CanElect() bool {
 }
 
 func (rf *Raft) logical(index int) int {
-	return index + rf.snapshotIndex
+	return index + rf.lastIncludedIndex
 }
 
 func (rf *Raft) actual(index int) int {
-	return index - rf.snapshotIndex
-}
-
-func (rf *Raft) updateLog(args *AppendEntriesArgs) {
-	rf.log = rf.truncateLog(args.PrevLogIndex + 1)
-	rf.log = append(rf.log, args.Entries...)
-	rf.persist()
-
-	DPrintf("\t\t%d after update log : %v\n", rf.me, rf.log)
-
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(rf.logical(rf.lastLogIndex()), args.LeaderCommit)
-		rf.applyCond.Signal()
-		DPrintf("\t\t%v update commitIndex = %v, lastsApplyId = %d\n",
-			rf.me, rf.commitIndex, rf.lastApplied)
-	}
+	return index - rf.lastIncludedIndex
 }
 
 func snapshotMsg(snapshot []byte, term, index int) *ApplyMsg {
@@ -263,10 +257,12 @@ func snapshotMsg(snapshot []byte, term, index int) *ApplyMsg {
 }
 
 func (rf *Raft) InstallSnapshotArgs() *InstallSnapshotArgs {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return &InstallSnapshotArgs{
 		Term:              rf.currentTerm,
-		LastIncludedIndex: rf.snapshotIndex,
-		LastIncludedTerm:  rf.log[0].Term,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
 		Data:              rf.persister.ReadSnapshot(),
 	}
 }

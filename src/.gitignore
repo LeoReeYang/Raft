@@ -13,3 +13,4 @@ mrtmp.*
 /raft/*.log
 /raft/test_test.go
 /raft/config.go
+/raft/2023*
