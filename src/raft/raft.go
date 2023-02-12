@@ -182,14 +182,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	actual := rf.actual(index)
 	term := rf.log[actual].Term
+
 	copy := clone(snapshot)
 	rf.persister.snapshot = copy
 
-	// Debug("\t\t%d original log = %v, last = %d, acutal = %d\n", rf.me, rf.log, rf.lastLogIndex(), rf.actual(index+1))
-	Debug(dSnap, "S%d trime at %d, last = %d, log = %v", rf.me, index, rf.lastLogIndex(), rf.log)
+	log := make([]Entry, 0)
+	log = append(log, rf.log[actual])
 
-	log := make([]Entry, 1)
-	log = append(log, rf.log[actual+1:]...)
+	if actual < rf.lastLogIndex() {
+		log = append(log, rf.log[actual+1:]...)
+	}
 	rf.log = log
 
 	rf.lastIncludedIndex = index
@@ -199,8 +201,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.applyCh <- *snapshotMsg(snapshot, term, index)
 	}(term, index, copy)
 
-	// Debug("\t\t%v called by Snapshot, lastIncludeIndex = %d term = %d, \n\t\ttrimmed log :%v", rf.me, index, term, rf.log)
-	Debug(dSnap, "S%d lastInclude = %d, trimmed log = %v", rf.me, rf.lastIncludedIndex, rf.log)
+	Debug(dSnap, "S%d take Snapshot to %d, lastIdx = %d, start = %d, end = %d",
+		rf.me,
+		index,
+		rf.logical(rf.lastLogIndex()),
+		rf.logicalStartIndex(),
+		rf.logical(rf.lastLogIndex()),
+	)
 }
 
 type InstallSnapshotArgs struct {
@@ -225,19 +232,21 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if args.Term < rf.currentTerm || args.LastIncludedTerm < rf.lastIncludedTerm || args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
+	rf.convertRole(args.Term)
 
 	copy := clone(args.Data)
 	rf.persister.snapshot = copy
 	rf.validAccess = true
 
-	rf.convertRole(args.Term)
-
 	snapshotIndex := args.LastIncludedIndex
 	snapshotTerm := args.LastIncludedTerm
+	actual := rf.actual(snapshotIndex)
 
-	log := make([]Entry, 1)
-	if snapshotIndex < rf.logical(rf.lastLogIndex()) {
-		log = append(log, rf.log[rf.actual(snapshotIndex+1):]...)
+	log := make([]Entry, 0)
+	log = append(log, Entry{Term: snapshotTerm})
+
+	if actual < rf.lastLogIndex() {
+		log = append(log, rf.log[actual+1:]...)
 	}
 	rf.log = log
 
@@ -252,12 +261,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	reply.Success = true
 
-	Debug(dSnap, "S%d install snapshot, lastindex = %d, applied = %d, commmit = %d, log = %v",
-		rf.me, rf.lastIncludedIndex, rf.lastApplied, rf.commitIndex, rf.log)
-
-	// go func() {
-	// 	rf.applyCh <- *snapshotMsg(copy, snapshotTerm, snapshotIndex)
-	// }()
+	Debug(dSnap, "S%d follower install Snapshot, lastInclude = %d, applied = %d, commmit = %d, start = %d, end = %d",
+		rf.me,
+		rf.lastIncludedIndex,
+		rf.lastApplied,
+		rf.commitIndex,
+		rf.logicalStartIndex(),
+		rf.logical(rf.lastLogIndex()),
+	)
 
 	rf.mu.Unlock()
 	rf.applyCh <- *snapshotMsg(copy, snapshotTerm, snapshotIndex)
@@ -308,13 +319,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.candidateNewer(args.LastLogTerm, args.LastLogIndex) {
 
 		rf.validAccess = true
-		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
-		Debug(dVote, "S%d votedFor = %d, term = %d", rf.me, args.CandidateId, rf.currentTerm)
+		rf.votedFor = args.CandidateId
+		Debug(dVote, "S%d vote -> %d  at term = %d",
+			rf.me,
+			args.CandidateId,
+			rf.currentTerm,
+		)
 		return
 	}
-	Debug(dVote, "S%d not vote, term = %d, votedFor = %d, log = %v",
-		rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 type AppendEntriesArgs struct {
@@ -338,7 +351,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = false
 	reply.Term = rf.currentTerm
 
-	// ignore the old term vote request
 	if args.Term < rf.currentTerm {
 		return
 	}
@@ -352,9 +364,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// we should check both the term & log, not just term higher make this AE or hb a valid rpc...
 	rf.convertRole(args.Term)
 
-	// if args.PrevLogTerm < rf.lastIncludedTerm || args.PrevLogIndex < rf.commitIndex || args.PrevLogIndex < rf.lastApplied {
-	// 	return
-	// }
 	if args.PrevLogIndex < rf.lastIncludedIndex {
 		return
 	}
@@ -366,17 +375,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 
-	rf.log = rf.truncateLog(args.PrevLogIndex + 1)
+	rf.log = rf.truncateLogTo(args.PrevLogIndex + 1)
 	rf.log = append(rf.log, args.Entries...)
 
-	Debug(dLog, "S%d after update, log %v", rf.me, rf.log)
+	Debug(dLog, "S%d follower update log, start = %d, end = %d, lastInclude = %d, commit = %d, applied = %d",
+		rf.me,
+		rf.logicalStartIndex(),
+		rf.logical(rf.lastLogIndex()),
+		rf.lastIncludedIndex,
+		rf.commitIndex,
+		rf.lastApplied,
+	)
 
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(rf.logical(rf.lastLogIndex()), args.LeaderCommit)
-		rf.applyCond.Signal()
+
 		Debug(dCommit, "S%d follower update commit = %d, lastApplied = %d",
-			rf.me, rf.commitIndex, rf.lastApplied)
+			rf.me,
+			rf.commitIndex,
+			rf.lastApplied,
+		)
+		rf.applyCond.Signal()
 	}
+
 }
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -442,7 +463,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index = rf.appendLog(command)
 	rf.persist()
-	Debug(dPersist, "S%d leader write log { %d %v }, index = %d persisted...\n", rf.me, rf.currentTerm, command, index)
+	Debug(dPersist, "S%d leader write log, start = %d, end = %d",
+		rf.me,
+		rf.logicalStartIndex(),
+		index,
+	)
 	term = rf.currentTerm
 
 	return index, term, isLeader
@@ -474,8 +499,12 @@ func (rf *Raft) startElection() {
 	rf.votedFor = rf.me
 	rf.persist()
 	args := rf.requestVoteArgs()
-	Debug(dVote, "S%d starts a new election, term = %d, log = %v",
-		rf.me, rf.currentTerm, rf.log)
+	Debug(dVote, "S%d electing..., term = %d, lastLogT = %d, lastLogIdx = %d",
+		rf.me,
+		rf.currentTerm,
+		rf.lastLogTerm(),
+		rf.logical(rf.lastLogIndex()),
+	)
 	rf.mu.Unlock()
 
 	votesChan := make(chan bool, len(rf.peers))
@@ -489,7 +518,11 @@ func (rf *Raft) startElection() {
 			reply := &RequestVoteReply{}
 
 			if ok := rf.sendRequestVote(serverID, args, reply); !ok {
-				Debug(dError, "S%d Candidate send RequestVote -> %d failed, term = %d", args.CandidateId, serverID, args.Term)
+				Debug(dError, "S%d Candidate send RequestVote -> %d failed, term = %d",
+					args.CandidateId,
+					serverID,
+					args.Term,
+				)
 				votesChan <- false
 				return
 			}
@@ -548,16 +581,9 @@ func (rf *Raft) heartbeat() {
 			reply := &AppendEntriesReply{}
 
 			if ok := rf.sendAppendEntries(serverId, args, reply); !ok {
+				Debug(dError, "S%d send AE -> %d failed...", rf.me, serverId)
 				return
 			}
-
-			rf.mu.Lock()
-			if rf.convertRole(reply.Term) {
-				rf.persist()
-				rf.mu.Unlock()
-				return
-			}
-			rf.mu.Unlock()
 
 			if reply.Success {
 				rf.UpdateIndex(serverId, args.PrevLogIndex+1+len(args.Entries))
@@ -565,6 +591,11 @@ func (rf *Raft) heartbeat() {
 			} else {
 				rf.DecreaseNext(serverId)
 			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			defer rf.persist()
+			rf.convertRole(reply.Term)
 		}(id)
 	}
 }
@@ -622,17 +653,22 @@ func (rf *Raft) applyLog(applyid int) bool {
 
 	select {
 	case rf.applyCh <- msg:
-		Debug(dApply, "S%d apply a msg ok, term = %d, applyLog = %v, applyIndex = %d",
-			rf.me, rf.currentTerm, rf.log[rf.actual(msg.CommandIndex)], msg.CommandIndex)
+		Debug(dApply, "S%d applied log successfully, term = %d, index = %d",
+			rf.me,
+			rf.currentTerm,
+			applyid,
+		)
 		return true
 	case <-timer.C:
-		Debug(dError, "S%d apply msg: %v timeout...", rf.me, msg)
+		Debug(dError, "S%d applied log timeout... term = %d, index = %d",
+			rf.me,
+			msg,
+		)
 		return false
 	}
 }
 
 func (rf *Raft) snapshot() {
-
 	for id := range rf.peers {
 		if id == rf.me {
 			continue
@@ -640,11 +676,19 @@ func (rf *Raft) snapshot() {
 		id := id
 		go func() {
 			args := rf.InstallSnapshotArgs()
-			Debug(dSnap, "S%d try send snapshot -> %d, lastIndex = %d", rf.me, id, args.LastIncludedIndex)
+			Debug(dSnap, "S%d try send snapshot -> %d, lastIndex = %d",
+				rf.me,
+				id,
+				args.LastIncludedIndex,
+			)
 
 			reply := &InstallSnapshotReply{}
 			if ok := rf.sendInstallSnapshot(id, args, reply); !ok {
-				Debug(dError, "S%d send snapshot -> %d failed...", rf.me, id)
+				Debug(dError, "S%d send snapshot -> %d failed...lastIndex = %d",
+					rf.me,
+					id,
+					args.LastIncludedIndex,
+				)
 				return
 			}
 
@@ -653,11 +697,15 @@ func (rf *Raft) snapshot() {
 			defer rf.persist()
 
 			if reply.Success {
-				Debug(dSnap, "S%d send snapshot -> %d ok, update match = %d, next = %d", rf.me, id, rf.lastIncludedIndex, rf.lastIncludedIndex+1)
-				rf.matchIndex[id] = rf.lastIncludedIndex
-				rf.nextIndex[id] = rf.lastIncludedIndex + 1
+				rf.matchIndex[id] = args.LastIncludedIndex
+				rf.nextIndex[id] = args.LastIncludedIndex + 1
+				Debug(dSnap, "S%d send snapshot -> %d reply successfully, update match = %d, next = %d",
+					rf.me,
+					id,
+					args.LastIncludedIndex,
+					args.LastIncludedIndex+1,
+				)
 			}
-
 			rf.convertRole(reply.Term)
 		}()
 	}
@@ -692,20 +740,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.electionTicker = time.NewTicker(GetRandomTime())
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
-	rf.snapshotTicker = time.NewTicker(150 * time.Millisecond)
+	rf.snapshotTicker = time.NewTicker(200 * time.Millisecond)
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.applyChan = make(chan int, 512)
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 
 	// initialize from state persisted before a crash
-	// rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
 	rf.persister.snapshot = rf.persister.ReadSnapshot()
-	Debug(dPersist, "S%d read Persist state, Term = %d, VotedFor = %d, lastapplied = %d, Log = %v",
-		rf.me, rf.currentTerm, rf.votedFor, rf.lastApplied, rf.log)
+	Debug(dPersist, "S%d read Persist state, term = %d, VotedFor = %d, start = %d, end = %d, commit = %d, lastApplied = %d",
+		rf.me,
+		rf.currentTerm,
+		rf.votedFor,
+		rf.logicalStartIndex(),
+		rf.logical(rf.lastLogIndex()),
+		rf.commitIndex,
+		rf.lastApplied,
+	)
 	// start ticker goroutine to start elections
-	// rf.mu.Unlock()
 
 	go rf.ticker()
 
