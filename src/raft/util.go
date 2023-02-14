@@ -26,13 +26,6 @@ func min(a, b int) int {
 		return b
 	}
 }
-func max(a, b int) int {
-	if a > b {
-		return a
-	} else {
-		return b
-	}
-}
 
 func GetRandomTime() time.Duration {
 	return time.Duration(BaseIntervalTime+rand.Intn(RandomTimeValue)) * time.Millisecond
@@ -63,13 +56,6 @@ func (rf *Raft) candidateNewer(lastLogTerm, lastLogIndex int) bool {
 	myTerm := rf.lastLogTerm()
 	myIndex := rf.logical(rf.lastLogIndex())
 
-	// Debug(dVote, "S%d compare log, myTerm = %d, myIndex = %d; Candidate: Term = %d, index = %d",
-	// 	rf.me,
-	// 	myTerm,
-	// 	myIndex,
-	// 	lastLogTerm,
-	// 	lastLogIndex)
-
 	if lastLogTerm < myTerm {
 		Debug(dInfo, "S%d can't vote due to smaller term, myTerm: %d, CandidateTerm: %d", rf.me, myTerm, lastLogTerm)
 	}
@@ -96,11 +82,6 @@ func (rf *Raft) containLog(term, index int) bool {
 		Debug(dInfo, "S%d not contain index = %d", rf.me, index)
 		return false
 	}
-
-	// // check out-date request
-	// if index == rf.lastIncludedIndex && rf.getLogEntry(index).Term == term {
-	// 	return true
-	// }
 
 	ret := term == rf.getLogEntry(index).Term
 	if !ret {
@@ -218,11 +199,6 @@ func (rf *Raft) DecreaseNext(id int) {
 			rf.nextIndex[id] = rf.matchIndex[id] + 1
 		}
 	}
-
-	// rf.nextIndex[id] = rf.nextIndex[id] - (rf.nextIndex[id]-rf.matchIndex[id])/2 - 1
-	// if rf.nextIndex[id] <= rf.matchIndex[id] {
-	// 	rf.nextIndex[id] = rf.matchIndex[id] + 1
-	// }
 }
 
 func (rf *Raft) convertRole(argsTerm int) bool {
@@ -252,7 +228,6 @@ func (rf *Raft) nextInitial() {
 func (rf *Raft) matchInitial() {
 	for id := range rf.matchIndex {
 		rf.matchIndex[id] = 0
-		// rf.matchIndex[id] = rf.lastIncludedIndex
 	}
 }
 

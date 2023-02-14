@@ -182,15 +182,8 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	actual := rf.actual(index)
 	entry := rf.getLogEntry(index)
-
-	var log []Entry
-	log = append(log, Entry{Term: entry.Term})
-
-	if actual < rf.lastLogIndex() {
-		log = append(log, rf.log[actual+1:]...)
-	}
-
-	rf.log = log
+	// no need to build a new slice & copy form rf.log
+	rf.log = rf.log[actual:]
 
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = entry.Term
@@ -227,11 +220,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Term = rf.currentTerm
 
-	if args.Term < rf.currentTerm || args.LastIncludedTerm < rf.lastIncludedTerm ||
-		args.LastIncludedIndex <= rf.lastIncludedIndex {
+	if args.Term < rf.currentTerm || args.LastIncludedIndex <= rf.lastIncludedIndex {
 		return
 	}
-	// rf.convertRole(args.Term)
 	rf.status = Follower
 
 	snapshotIndex := args.LastIncludedIndex
@@ -358,14 +349,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		return
 	}
-	// we should check the log now...maybe it will be a outdate log...
-	// consider a problem, when we had a fake leader AE, we can't make this AE or hb valied unless it was a up-to-date log leader.
-	// when a voteFor rpc delaied , the disconnect peer back with a election timer fires, then got the delay rpc voteFor, peer becomes
-	// fake leader(not up-to-date log to anyone), then the AE will stop the election timer fires, we will never had a true leader...
 
-	// rf.validAccess = true(we can't flash the validAccess here before we check the log is more up-to-date...)
-
-	// we should check both the term & log, not just term higher make this AE or hb a valid rpc...
 	rf.convertRole(args.Term)
 
 	rf.validAccess = true
