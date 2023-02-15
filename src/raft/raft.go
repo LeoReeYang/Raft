@@ -188,9 +188,10 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = entry.Term
 
-	rf.installSnapshot(snapshot)
-
 	go func(term, index int, snapshot []byte) {
+		rf.mu.Lock()
+		rf.installSnapshot(snapshot)
+		rf.mu.Unlock()
 		rf.applyCh <- *snapshotMsg(snapshot, term, index)
 	}(entry.Term, index, snapshot)
 
@@ -248,14 +249,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedIndex = snapshotIndex
 	rf.lastIncludedTerm = snapshotTerm
 
-	rf.mu.Unlock()
 	rf.applyCh <- ApplyMsg{
 		SnapshotValid: true,
 		Snapshot:      args.Data,
 		SnapshotTerm:  snapshotTerm,
 		SnapshotIndex: snapshotIndex,
 	}
-	rf.mu.Lock()
 
 	Debug(dSnap, "S%d follower installs Snapshot from %d, lastInclude = %d, applied = %d, commmit = %d, start = %d, end = %d",
 		rf.me,
@@ -659,12 +658,21 @@ func (rf *Raft) applyLog(applyid int) bool {
 }
 
 func (rf *Raft) snapshot() {
-	for id := range rf.peers {
-		if id == rf.me {
+	args := rf.InstallSnapshotArgs()
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.persister.ReadSnapshot() == nil {
+		return
+	}
+
+	for id, match := range rf.matchIndex {
+		// match == rf.lastIncludeIndex, we don't need to send install...Or may cause log periodically flush,
+		// and can't let peer recive rpc ?
+		if id == rf.me || match >= rf.lastIncludedIndex {
 			continue
 		}
 		go func(id int) {
-			args := rf.InstallSnapshotArgs()
 			Debug(dSnap, "S%d try to send snapshot -> %d, snapshot = %d",
 				rf.me,
 				id,
@@ -685,17 +693,6 @@ func (rf *Raft) snapshot() {
 			defer rf.mu.Unlock()
 			defer rf.persist()
 
-			if reply.Success {
-				rf.matchIndex[id] = args.LastIncludedIndex
-				rf.nextIndex[id] = args.LastIncludedIndex + 1
-
-				Debug(dSnap, "S%d got snapshot -> %d reply, update match = %d, next = %d",
-					rf.me,
-					id,
-					args.LastIncludedIndex,
-					args.LastIncludedIndex+1,
-				)
-			}
 			rf.convertRole(reply.Term)
 		}(id)
 	}

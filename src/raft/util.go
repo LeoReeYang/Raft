@@ -120,7 +120,8 @@ func (rf *Raft) AppendEntriesArgs(term, id int) *AppendEntriesArgs {
 	entries := make([]Entry, 0)
 
 	prevId := rf.nextIndex[id] - 1
-	if prevId < rf.lastIncludedIndex || prevId > rf.logical(rf.lastLogIndex()) {
+
+	if prevId < rf.lastIncludedIndex {
 		prevId = rf.lastIncludedIndex
 	}
 
